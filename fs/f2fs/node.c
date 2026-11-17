@@ -2955,6 +2955,7 @@ static inline void load_free_nid_bitmap(struct f2fs_sb_info *sbi)
 			break;
 
 		__set_bit_le(i, nm_i->nat_block_bitmap);
+		nm_i->scaned_nat_blocks++;
 
 		nid = i * NAT_ENTRY_PER_BLOCK;
 		last_nid = nid + NAT_ENTRY_PER_BLOCK;
@@ -2971,6 +2972,7 @@ static inline void load_free_nid_bitmap(struct f2fs_sb_info *sbi)
 			break;
 
 		__set_bit_le(i, nm_i->nat_block_bitmap);
+		nm_i->scaned_nat_blocks++;
 	}
 }
 
