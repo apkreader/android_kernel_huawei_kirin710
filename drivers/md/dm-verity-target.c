@@ -532,9 +532,10 @@ static void verity_work(struct work_struct *w)
 	verity_finish_io(io, verity_verify_io(io));
 }
 
-static void verity_end_io(struct bio *bio, int error)
+static void verity_end_io(struct bio *bio)
 {
 	struct dm_verity_io *io = bio->bi_private;
+	int error = bio->bi_error;
 
 	if (error && !verity_fec_is_enabled(io->v)) {
 		verity_finish_io(io, error);
