@@ -23,8 +23,10 @@ generated in the build output directory.
 
 ## Status
 
-Builds with the AOSP Android 9 GCC 4.9 toolchain and boots recovery on the
-MAR-LX1B. Android 17's native shell runs; a full Android boot is still untested.
+This branch matches the kernel source and configuration used for the
+LineageOS 24 development build. The phone has booted Android and passed
+the WPA2 Wi-Fi test with this kernel. The ROM also uses private init and
+system changes. Bluetooth and cellular are still being brought up.
 KernelSU is not included.
 
 `MADV_WIPEONFORK` and `MADV_KEEPONFORK` are backported from upstream Linux.
