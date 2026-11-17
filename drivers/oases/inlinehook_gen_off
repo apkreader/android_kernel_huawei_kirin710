@@ -31,7 +31,7 @@ get_off() {
     _mem=$4
     hex="\\x${_mem:8:2}\\x${_mem:6:2}\\x${_mem:4:2}\\x${_mem:2:2}"
     hex=`echo -e ${hex}`
-    off=`LANG=C LC_ALL=C grep -obUaP "${hex}" ${_src} | cut -d':' -f1`
+    off=`LANG=C LC_ALL=C grep -aboF "${hex}" ${_src} | cut -d':' -f1`
     echo "#define ${_key} ${off}" >> ${_out}
 }
 
