@@ -17,11 +17,19 @@ MAR-LX1B / MAR-L21B running EMUI 9.1.0.399 (C431), kernel 4.9.148. The source
 release predates that firmware; matching version numbers do not establish
 that the sources and device configuration are an exact match.
 
+The public build disables Huawei CFI, RandStruct and StructLeak compiler
+plugins that are absent from the AOSP toolchain. Module signing uses a key
+generated in the build output directory.
+
 ## Status
 
-Not built or boot-tested for this device. Android 17 compatibility and
-current-toolchain support still need to be implemented. KernelSU is not
-included.
+Builds with the AOSP Android 9 GCC 4.9 toolchain and boots recovery on the
+MAR-LX1B. Android 17's native shell runs; a full Android boot is still untested.
+KernelSU is not included.
+
+`MADV_WIPEONFORK` and `MADV_KEEPONFORK` are backported from upstream Linux.
+On-device tests cover child memory clearing, repeated forks, parent isolation,
+restoring inheritance, and rejecting shared or file-backed mappings.
 
 Huawei's original build notes are in `README_Kernel.txt`. They expect the
 older `aarch64-linux-android-4.9` toolchain and produce `Image.gz`. The phone
