@@ -4,6 +4,10 @@
  */
 #include <linux/export.h>
 #include <linux/fs.h>
+#include <linux/bpf.h>
+#include <linux/bpf_local_storage.h>
+#include <linux/bpf.h>
+#include <linux/bpf_local_storage.h>
 #include <linux/mm.h>
 #include <linux/backing-dev.h>
 #include <linux/hash.h>
@@ -199,6 +203,12 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
 	mapping->private_data = NULL;
 	mapping->writeback_index = 0;
 	inode->i_private = NULL;
+#ifdef CONFIG_BPF_SYSCALL
+	RCU_INIT_POINTER(inode->i_bpf_storage, NULL);
+#endif
+#ifdef CONFIG_BPF_SYSCALL
+	RCU_INIT_POINTER(inode->i_bpf_storage, NULL);
+#endif
 	inode->i_mapping = mapping;
 	INIT_HLIST_HEAD(&inode->i_dentry);	/* buggered by rcu freeing */
 #ifdef CONFIG_FS_POSIX_ACL
@@ -250,6 +260,8 @@ void __destroy_inode(struct inode *inode)
 {
 	BUG_ON(inode_has_buffers(inode));
 	inode_detach_wb(inode);
+	bpf_inode_storage_free(inode);
+	bpf_inode_storage_free(inode);
 	security_inode_free(inode);
 	fsnotify_inode_delete(inode);
 	locks_free_lock_context(inode);

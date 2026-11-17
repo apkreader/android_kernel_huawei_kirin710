@@ -46,6 +46,47 @@ struct dma_buf_list {
 
 static struct dma_buf_list db_list;
 
+struct dma_buf *dma_buf_iter_begin(void)
+{
+	struct dma_buf *ret = NULL, *dmabuf;
+
+	/*
+	 * The list mutex does not protect a dmabuf's refcount, so it can be
+	 * zeroed while we are iterating. We cannot call get_dma_buf() since the
+	 * caller may not already own a reference to the buffer.
+	 */
+	mutex_lock(&db_list.lock);
+	list_for_each_entry(dmabuf, &db_list.head, list_node) {
+		if (get_file_rcu(dmabuf->file)) {
+			ret = dmabuf;
+			break;
+		}
+	}
+	mutex_unlock(&db_list.lock);
+	return ret;
+}
+
+struct dma_buf *dma_buf_iter_next(struct dma_buf *dmabuf)
+{
+	struct dma_buf *ret = NULL;
+
+	/*
+	 * The list mutex does not protect a dmabuf's refcount, so it can be
+	 * zeroed while we are iterating. We cannot call get_dma_buf() since the
+	 * caller may not already own a reference to the buffer.
+	 */
+	mutex_lock(&db_list.lock);
+	dma_buf_put(dmabuf);
+	list_for_each_entry_continue(dmabuf, &db_list.head, list_node) {
+		if (get_file_rcu(dmabuf->file)) {
+			ret = dmabuf;
+			break;
+		}
+	}
+	mutex_unlock(&db_list.lock);
+	return ret;
+}
+
 static int dma_buf_release(struct inode *inode, struct file *file)
 {
 	struct dma_buf *dmabuf;

@@ -191,6 +191,11 @@ int ns_get_name(char *buf, size_t size, struct task_struct *task,
 	return res;
 }
 
+bool ns_match(const struct ns_common *ns, dev_t dev, ino_t ino)
+{
+	return (ns->inum == ino) && (nsfs_mnt->mnt_sb->s_dev == dev);
+}
+
 struct file *proc_ns_fget(int fd)
 {
 	struct file *file;
@@ -241,4 +246,18 @@ void __init nsfs_init(void)
 	if (IS_ERR(nsfs_mnt))
 		panic("can't set nsfs up\n");
 	nsfs_mnt->mnt_sb->s_flags &= ~MS_NOUSER;
+}
+
+void *ns_get_path_cb(struct path *path, ns_get_path_helper_t *ns_get_cb,
+		     void *private_data)
+{
+	void *ret;
+
+	do {
+		struct ns_common *ns = ns_get_cb(private_data);
+		if (!ns)
+			return ERR_PTR(-ENOENT);
+		ret = __ns_get_path(path, ns);
+	} while (ret == ERR_PTR(-EAGAIN));
+	return ret;
 }

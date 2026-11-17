@@ -104,6 +104,7 @@ typedef int (*hhee_callback_t)(unsigned int len, void *buf);
 int hhee_msg_init(void);
 int hhee_msg_register_handler(unsigned int id, hhee_callback_t fn);
 int hhee_check_enable(void);
+int hhee_update_exec(const void *base, unsigned long size);
 
 static inline struct arm_smccc_res hhee_fn_hvc(unsigned long function_id,
 			unsigned long arg0, unsigned long arg1,

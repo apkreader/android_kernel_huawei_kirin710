@@ -161,6 +161,8 @@ struct tcp_options_received {
 		sack_ok : 4,	/* SACK seen on SYN packet		*/
 		snd_wscale : 4,	/* Window scaling received from sender	*/
 		rcv_wscale : 4;	/* Window scaling to send to receiver	*/
+	u8	saw_unknown:1,	/* Received unknown option		*/
+		unused:7;
 	u8	num_sacks;	/* Number of SACK blocks		*/
 	u16	user_mss;	/* mss requested by user in ioctl	*/
 	u16	mss_clamp;	/* Maximal mss, negotiated at connection setup */
@@ -193,6 +195,7 @@ struct tcp_request_sock {
 						  * FastOpen it's the seq#
 						  * after data-in-SYN.
 						  */
+	u8				syn_tos;
 };
 
 static inline struct tcp_request_sock *tcp_rsk(const struct request_sock *req)
@@ -254,6 +257,9 @@ struct tcp_sock {
 				 * sum(delta(snd_una)), or how many bytes
 				 * were acked.
 				 */
+	u32	dsack_dups;	/* RFC4898 tcpEStatsStackDSACKDups
+				 * total number of DSACK blocks received
+				 */
 	struct u64_stats_sync syncp; /* protects 64bit vars (cf tcp_get_info()) */
 
  	u32	snd_una;	/* First byte we want an ack for	*/
@@ -265,7 +271,6 @@ struct tcp_sock {
 	u32	tsoffset;	/* timestamp offset */
 
 	struct list_head tsq_node; /* anchor in tsq_tasklet.head list */
-	unsigned long	tsq_flags;
 
 	/* Data for direct copy to user */
 	struct {
@@ -291,9 +296,15 @@ struct tcp_sock {
 		u8 reord;    /* reordering detected */
 	} rack;
 	u16	advmss;		/* Advertised MSS			*/
-	u8	rate_app_limited:1,  /* rate_{delivered,interval_us} limited? */
+	u8	tlp_retrans:1,	/* TLP is a retransmission */
+		unused_1:7;
+	u32	chrono_start;	/* Start time in jiffies of a TCP chrono */
+	u32	chrono_stat[3];	/* Time in jiffies for chrono_stat stats */
+	u8	chrono_type:2,	/* current chronograph type */
+		rate_app_limited:1,  /* rate_{delivered,interval_us} limited? */
 		fastopen_connect:1, /* FASTOPEN_CONNECT sockopt */
 		is_sack_reneg:1,    /* in recovery from loss with SACK reneg? */
+		save_syn:2,	/* Save headers of SYN packet */
 		unused:5;
 	u8	nonagle     : 4,/* Disable Nagle algorithm?             */
 		thin_lto    : 1,/* Use linear timeouts for thin streams */
@@ -305,8 +316,9 @@ struct tcp_sock {
 		syn_data:1,	/* SYN includes data */
 		syn_fastopen:1,	/* SYN includes Fast Open option */
 		syn_fastopen_exp:1,/* SYN includes Fast Open exp. option */
+		syn_fastopen_ch:1, /* Active TFO re-enabling probe */
 		syn_data_acked:1,/* data in SYN is acked by SYN-ACK */
-		save_syn:1,	/* Save headers of SYN packet */
+		unused_2:1,
 		is_cwnd_limited:1;/* forward progress limited by snd_cwnd? */
 	u32	tlp_high_seq;	/* snd_nxt at the time of TLP retransmit. */
 
@@ -348,6 +360,7 @@ struct tcp_sock {
 				 * receiver in Recovery. */
 	u32	prr_out;	/* Total number of pkts sent during Recovery. */
 	u32	delivered;	/* Total data packets delivered incl. rexmits */
+	u32	delivered_ce;	/* Like the above but only ECE marked packets */
 	u32	lost;		/* Total data packets lost incl. rexmits */
 	u32	app_limited;	/* limited until "delivered" reaches this val */
 	struct skb_mstamp first_tx_mstamp;  /* start of window send phase */
@@ -368,6 +381,7 @@ struct tcp_sock {
 	u8	nodelay;	/* Auto tcp no delay is disabled */
 	u8	pingpong;	/* send msg count without response */
 #endif
+	struct hrtimer	pacing_timer;
 
 	/* from STCP, retrans queue hinting */
 	struct sk_buff* lost_skb_hint;
@@ -407,6 +421,29 @@ struct tcp_sock {
 	unsigned int		keepalive_intvl;  /* time interval between keep alive probes */
 
 	int			linger2;
+
+/* Sock_ops bpf program related variables */
+#ifdef CONFIG_BPF
+	u8	bpf_sock_ops_cb_flags;  /* Control calling BPF programs
+					 * values defined in uapi/linux/tcp.h
+					 */
+#define BPF_SOCK_OPS_TEST_FLAG(TP, ARG) (TP->bpf_sock_ops_cb_flags & ARG)
+#else
+#define BPF_SOCK_OPS_TEST_FLAG(TP, ARG) 0
+#endif
+
+/* Network Pacemaker */
+#ifdef CONFIG_NETPM
+	u8 netpm_netif;
+	u8 netpm_rbuf_flag;
+	u32 netpm_rtt_min;
+	u32 netpm_srtt;
+	u32 netpm_rttvar;
+	int netpm_cwnd_est;
+	int netpm_tcp_rmem_max;
+	int netpm_max_tput;
+	int netpm_rmem_max_curbdp;
+#endif
 
 /* Receiver side RTT estimation */
 	struct {
@@ -460,8 +497,7 @@ struct tcp_sock {
 	 * socket. Used to retransmit SYNACKs etc.
 	 */
 	struct request_sock *fastopen_rsk;
-	u32	*saved_syn;
-
+	struct saved_syn *saved_syn;
 #ifdef CONFIG_TCP_ARGO
 /* TCP ARGO */
 	struct tcp_argo *argo;
@@ -519,7 +555,7 @@ struct tcp_sock {
 #endif /* CONFIG_MPTCP */
 };
 
-enum tsq_flags {
+enum tsq_enum {
 	TSQ_THROTTLED,
 	TSQ_QUEUED,
 	TCP_TSQ_DEFERRED,	   /* tcp_tasklet_func() found socket was owned */
@@ -533,6 +569,15 @@ enum tsq_flags {
 	MPTCP_SUB_DEFERRED, /* A subflow got deferred - process them */
 	MPTCP_USER_SWTCH_DEFERRED, /* A user switch event deferred - process them */
 #endif /* CONFIG_MPTCP */
+};
+
+enum tsq_flags {
+	TSQF_THROTTLED			= (1UL << TSQ_THROTTLED),
+	TSQF_QUEUED			= (1UL << TSQ_QUEUED),
+	TCPF_TSQ_DEFERRED		= (1UL << TCP_TSQ_DEFERRED),
+	TCPF_WRITE_TIMER_DEFERRED	= (1UL << TCP_WRITE_TIMER_DEFERRED),
+	TCPF_DELACK_TIMER_DEFERRED	= (1UL << TCP_DELACK_TIMER_DEFERRED),
+	TCPF_MTU_REDUCED_DEFERRED	= (1UL << TCP_MTU_REDUCED_DEFERRED),
 };
 
 static inline struct tcp_sock *tcp_sk(const struct sock *sk)
@@ -592,4 +637,24 @@ static inline void tcp_saved_syn_free(struct tcp_sock *tp)
 	tp->saved_syn = NULL;
 }
 
+static inline u32 tcp_saved_syn_len(const struct saved_syn *saved_syn)
+{
+	return saved_syn->mac_hdrlen + saved_syn->network_hdrlen +
+		saved_syn->tcp_hdrlen;
+}
+
+int tcp_skb_shift(struct sk_buff *to, struct sk_buff *from, int pcount,
+		  int shiftlen);
+
+struct sk_buff *tcp_get_timestamping_opt_stats(const struct sock *sk);
+
+static inline u16 tcp_mss_clamp(const struct tcp_sock *tp, u16 mss)
+{
+	/* We use READ_ONCE() here because socket might not be locked.
+	 * This happens for listeners.
+	 */
+	u16 user_mss = READ_ONCE(tp->rx_opt.user_mss);
+
+	return (user_mss && user_mss < mss) ? user_mss : mss;
+}
 #endif	/* _LINUX_TCP_H */

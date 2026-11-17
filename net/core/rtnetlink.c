@@ -16,6 +16,7 @@
  *	Vitaly E. Lavrov		RTA_OK arithmetics was wrong.
  */
 
+#include <linux/bitops.h>
 #include <linux/errno.h>
 #include <linux/module.h>
 #include <linux/types.h>
@@ -39,6 +40,7 @@
 #include <linux/if_vlan.h>
 #include <linux/pci.h>
 #include <linux/etherdevice.h>
+#include <linux/bpf.h>
 
 #include <asm/uaccess.h>
 
@@ -899,15 +901,14 @@ static size_t rtnl_port_size(const struct net_device *dev,
 		return port_self_size;
 }
 
-static size_t rtnl_xdp_size(const struct net_device *dev)
+static size_t rtnl_xdp_size(void)
 {
 	size_t xdp_size = nla_total_size(0) +	/* nest IFLA_XDP */
-			  nla_total_size(1);	/* XDP_ATTACHED */
+			  nla_total_size(1) +	/* XDP_ATTACHED */
+			  nla_total_size(4) +	/* XDP_PROG_ID or 1st mode */
+			  nla_total_size(4);	/* second per-mode ID */
 
-	if (!dev->netdev_ops->ndo_xdp)
-		return 0;
-	else
-		return xdp_size;
+	return xdp_size;
 }
 
 static noinline size_t if_nlmsg_size(const struct net_device *dev,
@@ -947,7 +948,7 @@ static noinline size_t if_nlmsg_size(const struct net_device *dev,
 	       + nla_total_size(MAX_PHYS_ITEM_ID_LEN) /* IFLA_PHYS_PORT_ID */
 	       + nla_total_size(MAX_PHYS_ITEM_ID_LEN) /* IFLA_PHYS_SWITCH_ID */
 	       + nla_total_size(IFNAMSIZ) /* IFLA_PHYS_PORT_NAME */
-	       + rtnl_xdp_size(dev) /* IFLA_XDP */
+	       + rtnl_xdp_size() /* IFLA_XDP */
 	       + nla_total_size(1); /* IFLA_PROTO_DOWN */
 
 }
@@ -1254,24 +1255,82 @@ static int rtnl_fill_link_ifmap(struct sk_buff *skb, struct net_device *dev)
 	return 0;
 }
 
-static int rtnl_xdp_fill(struct sk_buff *skb, struct net_device *dev)
+static u32 rtnl_xdp_prog_skb(struct net_device *dev)
 {
-	struct netdev_xdp xdp_op = {};
-	struct nlattr *xdp;
+	return dev_xdp_prog_id(dev, XDP_MODE_SKB);
+}
+
+static u32 rtnl_xdp_prog_drv(struct net_device *dev)
+{
+	return dev_xdp_prog_id(dev, XDP_MODE_DRV);
+}
+
+static u32 rtnl_xdp_prog_hw(struct net_device *dev)
+{
+	return dev_xdp_prog_id(dev, XDP_MODE_HW);
+}
+
+static int rtnl_xdp_report_one(struct sk_buff *skb, struct net_device *dev,
+			       u32 *prog_id, u8 *mode, u8 target_mode,
+			       u32 attr,
+			       u32 (*get_prog_id)(struct net_device *dev))
+{
+	u32 current_id;
 	int err;
 
-	if (!dev->netdev_ops->ndo_xdp)
+	current_id = get_prog_id(dev);
+	if (!current_id)
 		return 0;
+
+	*prog_id = current_id;
+	err = nla_put_u32(skb, attr, current_id);
+	if (err)
+		return err;
+
+	if (*mode != XDP_ATTACHED_NONE)
+		*mode = XDP_ATTACHED_MULTI;
+	else
+		*mode = target_mode;
+
+	return 0;
+}
+
+static int rtnl_xdp_fill(struct sk_buff *skb, struct net_device *dev)
+{
+	struct nlattr *xdp;
+	u32 prog_id = 0;
+	u8 mode = XDP_ATTACHED_NONE;
+	int err;
+
 	xdp = nla_nest_start(skb, IFLA_XDP);
 	if (!xdp)
 		return -EMSGSIZE;
-	xdp_op.command = XDP_QUERY_PROG;
-	err = dev->netdev_ops->ndo_xdp(dev, &xdp_op);
+
+	err = rtnl_xdp_report_one(skb, dev, &prog_id, &mode,
+				  XDP_ATTACHED_SKB, IFLA_XDP_SKB_PROG_ID,
+				  rtnl_xdp_prog_skb);
 	if (err)
 		goto err_cancel;
-	err = nla_put_u8(skb, IFLA_XDP_ATTACHED, xdp_op.prog_attached);
+	err = rtnl_xdp_report_one(skb, dev, &prog_id, &mode,
+				  XDP_ATTACHED_DRV, IFLA_XDP_DRV_PROG_ID,
+				  rtnl_xdp_prog_drv);
 	if (err)
 		goto err_cancel;
+	err = rtnl_xdp_report_one(skb, dev, &prog_id, &mode,
+				  XDP_ATTACHED_HW, IFLA_XDP_HW_PROG_ID,
+				  rtnl_xdp_prog_hw);
+	if (err)
+		goto err_cancel;
+
+	err = nla_put_u8(skb, IFLA_XDP_ATTACHED, mode);
+	if (err)
+		goto err_cancel;
+
+	if (prog_id && mode != XDP_ATTACHED_MULTI) {
+		err = nla_put_u32(skb, IFLA_XDP_PROG_ID, prog_id);
+		if (err)
+			goto err_cancel;
+	}
 
 	nla_nest_end(skb, xdp);
 	return 0;
@@ -1507,7 +1566,13 @@ static const struct nla_policy ifla_port_policy[IFLA_PORT_MAX+1] = {
 
 static const struct nla_policy ifla_xdp_policy[IFLA_XDP_MAX + 1] = {
 	[IFLA_XDP_FD]		= { .type = NLA_S32 },
+	[IFLA_XDP_EXPECTED_FD]	= { .type = NLA_S32 },
 	[IFLA_XDP_ATTACHED]	= { .type = NLA_U8 },
+	[IFLA_XDP_FLAGS]	= { .type = NLA_U32 },
+	[IFLA_XDP_PROG_ID]	= { .type = NLA_U32 },
+	[IFLA_XDP_DRV_PROG_ID]	= { .type = NLA_U32 },
+	[IFLA_XDP_SKB_PROG_ID]	= { .type = NLA_U32 },
+	[IFLA_XDP_HW_PROG_ID]	= { .type = NLA_U32 },
 };
 
 static const struct rtnl_link_ops *linkinfo_to_kind_ops(const struct nlattr *nla)
@@ -2174,19 +2239,48 @@ static int do_setlink(const struct sk_buff *skb,
 
 	if (tb[IFLA_XDP]) {
 		struct nlattr *xdp[IFLA_XDP_MAX + 1];
+		u32 xdp_flags = 0;
 
 		err = nla_parse_nested(xdp, IFLA_XDP_MAX, tb[IFLA_XDP],
 				       ifla_xdp_policy);
 		if (err < 0)
 			goto errout;
 
-		if (xdp[IFLA_XDP_ATTACHED]) {
+		if (xdp[IFLA_XDP_ATTACHED] || xdp[IFLA_XDP_PROG_ID] ||
+		    xdp[IFLA_XDP_DRV_PROG_ID] ||
+		    xdp[IFLA_XDP_SKB_PROG_ID] ||
+		    xdp[IFLA_XDP_HW_PROG_ID]) {
 			err = -EINVAL;
 			goto errout;
 		}
+
+		if (xdp[IFLA_XDP_FLAGS]) {
+			xdp_flags = nla_get_u32(xdp[IFLA_XDP_FLAGS]);
+			if (xdp_flags & ~XDP_FLAGS_MASK) {
+				err = -EINVAL;
+				goto errout;
+			}
+			if (hweight32(xdp_flags & XDP_FLAGS_MODES) > 1) {
+				err = -EINVAL;
+				goto errout;
+			}
+		}
+
 		if (xdp[IFLA_XDP_FD]) {
+			int expected_fd = -1;
+
+			if (xdp_flags & XDP_FLAGS_REPLACE) {
+				if (!xdp[IFLA_XDP_EXPECTED_FD]) {
+					err = -EINVAL;
+					goto errout;
+				}
+				expected_fd =
+					nla_get_s32(xdp[IFLA_XDP_EXPECTED_FD]);
+			}
+
 			err = dev_change_xdp_fd(dev,
-						nla_get_s32(xdp[IFLA_XDP_FD]));
+						nla_get_s32(xdp[IFLA_XDP_FD]),
+						expected_fd, xdp_flags);
 			if (err)
 				goto errout;
 			status |= DO_SETLINK_NOTIFY;

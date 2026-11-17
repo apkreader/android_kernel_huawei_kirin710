@@ -1628,6 +1628,14 @@ ret:
  * Returns true if our parent ignored us and so we've switched to
  * self-reaping.
  */
+static void do_notify_pidfd(struct task_struct *task)
+{
+	struct pid *pid;
+
+	pid = task_pid(task);
+	wake_up_all(&pid->wait_pidfd);
+}
+
 bool do_notify_parent(struct task_struct *tsk, int sig)
 {
 	struct siginfo info;
@@ -1643,6 +1651,8 @@ bool do_notify_parent(struct task_struct *tsk, int sig)
 
 	BUG_ON(!tsk->ptrace &&
 	       (tsk->group_leader != tsk || !thread_group_empty(tsk)));
+
+	do_notify_pidfd(tsk);
 
 	if (sig != SIGCHLD) {
 		/*

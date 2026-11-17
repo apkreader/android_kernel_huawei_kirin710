@@ -1931,21 +1931,25 @@ void module_disable_ro(const struct module *mod)
 	frob_rodata(&mod->init_layout, set_memory_rw);
 }
 
-static inline void hhee_lkm_update(const struct module_layout *layout)
+int hhee_update_exec(const void *base, unsigned long size)
 {
 #ifdef CONFIG_HISI_HHEE_TOKEN
 	struct arm_smccc_res res;
+
 	if (HHEE_ENABLE != hhee_check_enable())
-			return;
-	arm_smccc_hvc(HHEE_LKM_UPDATE, (unsigned long)layout->base,
-			layout->text_size, clarify_token, 0, 0, 0, 0, &res);
-
+		return 0;
+	arm_smccc_hvc(HHEE_LKM_UPDATE, (unsigned long)base,
+		     size, clarify_token, 0, 0, 0, 0, &res);
 	if (res.a0)
-		pr_err("service from hhee failed test.\n");
-
-#else
-	(void *)layout;
+		return -EACCES;
 #endif
+	return 0;
+}
+
+static inline void hhee_lkm_update(const struct module_layout *layout)
+{
+	if (hhee_update_exec(layout->base, layout->text_size))
+		pr_err("service from hhee failed test.\n");
 }
 
 void module_enable_ro(const struct module *mod, bool after_init)

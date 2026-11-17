@@ -62,3 +62,9 @@ obj-$(CONFIG_NETLABEL) += cipso_ipv4.o
 
 obj-$(CONFIG_XFRM) += xfrm4_policy.o xfrm4_state.o xfrm4_input.o \
 		      xfrm4_output.o xfrm4_protocol.o
+
+obj-y += tcp_ulp.o
+obj-$(CONFIG_NET_SOCK_MSG) += tcp_bpf.o
+
+obj-$(CONFIG_BPF_JIT) += bpf_tcp_ca.o
+obj-$(CONFIG_NET_SOCK_MSG) += udp_bpf.o

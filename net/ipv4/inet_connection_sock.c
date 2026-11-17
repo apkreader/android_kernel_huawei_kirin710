@@ -547,12 +547,14 @@ static bool reqsk_queue_unlink(struct request_sock_queue *queue,
 	return found;
 }
 
-void inet_csk_reqsk_queue_drop(struct sock *sk, struct request_sock *req)
+bool inet_csk_reqsk_queue_drop(struct sock *sk, struct request_sock *req)
 {
 	if (reqsk_queue_unlink(&inet_csk(sk)->icsk_accept_queue, req)) {
 		reqsk_queue_removed(&inet_csk(sk)->icsk_accept_queue, req);
 		reqsk_put(req);
+		return true;
 	}
+	return false;
 }
 EXPORT_SYMBOL(inet_csk_reqsk_queue_drop);
 
@@ -1014,3 +1016,12 @@ out:
 	return dst;
 }
 EXPORT_SYMBOL_GPL(inet_csk_update_pmtu);
+
+int inet_rcv_saddr_any(const struct sock *sk)
+{
+#if IS_ENABLED(CONFIG_IPV6)
+	if (sk->sk_family == AF_INET6)
+		return ipv6_addr_any(&sk->sk_v6_rcv_saddr);
+#endif
+	return !sk->sk_rcv_saddr;
+}

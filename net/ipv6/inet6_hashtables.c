@@ -25,6 +25,8 @@
 #include <net/ip.h>
 #include <net/sock_reuseport.h>
 
+extern struct inet_hashinfo tcp_hashinfo;
+
 u32 inet6_ehashfn(const struct net *net,
 		  const struct in6_addr *laddr, const u16 lport,
 		  const struct in6_addr *faddr, const __be16 fport)
@@ -96,7 +98,8 @@ EXPORT_SYMBOL(__inet6_lookup_established);
 static inline int compute_score(struct sock *sk, struct net *net,
 				const unsigned short hnum,
 				const struct in6_addr *daddr,
-				const int dif, bool exact_dif)
+				const int dif, const int sdif,
+				bool exact_dif)
 {
 	int score = -1;
 
@@ -110,14 +113,63 @@ static inline int compute_score(struct sock *sk, struct net *net,
 			score++;
 		}
 		if (sk->sk_bound_dev_if || exact_dif) {
-			if (sk->sk_bound_dev_if != dif)
+			bool dev_match = (sk->sk_bound_dev_if == dif ||
+					  sk->sk_bound_dev_if == sdif);
+
+			if (!dev_match)
 				return -1;
-			score++;
+			if (sk->sk_bound_dev_if)
+				score++;
 		}
-		if (sk->sk_incoming_cpu == raw_smp_processor_id())
+		if (READ_ONCE(sk->sk_incoming_cpu) == raw_smp_processor_id())
 			score++;
 	}
 	return score;
+}
+
+static struct sock *lookup_reuseport(struct net *net, struct sock *sk,
+				     struct sk_buff *skb, int doff,
+				     const struct in6_addr *saddr,
+				     __be16 sport,
+				     const struct in6_addr *daddr,
+				     unsigned short hnum, u32 *phash)
+{
+	struct sock *reuse_sk = NULL;
+	u32 hash;
+
+	if (sk->sk_reuseport) {
+		hash = inet6_ehashfn(net, daddr, hnum, saddr, sport);
+		if (phash)
+			*phash = hash;
+		reuse_sk = reuseport_select_sock(sk, hash, skb, doff);
+	}
+	return reuse_sk;
+}
+
+static inline struct sock *inet6_lookup_run_bpf(struct net *net,
+						struct inet_hashinfo *hashinfo,
+						struct sk_buff *skb, int doff,
+						const struct in6_addr *saddr,
+						const __be16 sport,
+						const struct in6_addr *daddr,
+						const u16 hnum)
+{
+	struct sock *sk, *reuse_sk;
+	bool no_reuseport;
+
+	if (hashinfo != &tcp_hashinfo)
+		return NULL;
+
+	no_reuseport = bpf_sk_lookup_run_v6(net, IPPROTO_TCP,
+					    saddr, sport, daddr, hnum, &sk);
+	if (no_reuseport || IS_ERR_OR_NULL(sk))
+		return sk;
+
+	reuse_sk = lookup_reuseport(net, sk, skb, doff, saddr, sport,
+				    daddr, hnum, NULL);
+	if (reuse_sk)
+		sk = reuse_sk;
+	return sk;
 }
 
 /* called with rcu_read_lock() */
@@ -135,15 +187,23 @@ struct sock *inet6_lookup_listener(struct net *net,
 	struct sock *sk, *result = NULL;
 	u32 phash = 0;
 
+	if (static_branch_unlikely(&bpf_sk_lookup_enabled)) {
+		result = inet6_lookup_run_bpf(net, hashinfo, skb, doff,
+					      saddr, sport, daddr, hnum);
+		if (result)
+			goto done;
+	}
+
 	sk_for_each(sk, &ilb->head) {
-		score = compute_score(sk, net, hnum, daddr, dif, exact_dif);
+		score = compute_score(sk, net, hnum, daddr, dif, 0, exact_dif);
 		if (score > hiscore) {
 			reuseport = sk->sk_reuseport;
 			if (reuseport) {
-				phash = inet6_ehashfn(net, daddr, hnum,
-						      saddr, sport);
-				result = reuseport_select_sock(sk, phash,
-							       skb, doff);
+				result = lookup_reuseport(net, sk, skb, doff,
+						  saddr, sport, daddr, hnum,
+						  &phash);
+				if (unlikely(IS_ERR(result)))
+					return NULL;
 				if (result)
 					return result;
 				matches = 1;
@@ -157,6 +217,9 @@ struct sock *inet6_lookup_listener(struct net *net,
 			phash = next_pseudo_random32(phash);
 		}
 	}
+done:
+	if (IS_ERR(result))
+		return NULL;
 	return result;
 }
 EXPORT_SYMBOL_GPL(inet6_lookup_listener);

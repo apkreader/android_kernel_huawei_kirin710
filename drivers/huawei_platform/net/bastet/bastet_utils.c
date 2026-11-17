@@ -607,7 +607,7 @@ struct sock *get_sock_by_comm_prop(struct bst_sock_comm_prop *guide)
 #else
 	return __inet_lookup_established(net,
 		&tcp_hashinfo, guide->remote_ip, guide->remote_port,
-		guide->local_ip, ntohs(guide->local_port), dev->ifindex);
+		guide->local_ip, ntohs(guide->local_port), dev->ifindex, 0);
 #endif
 }
 

@@ -227,6 +227,10 @@ struct tcp_info {
 	__u32	tcpi_data_segs_out;	/* RFC4898 tcpEStatsDataSegsOut */
 
 	__u64   tcpi_delivery_rate;
+	__u64 tcpi_busy_time;
+	__u64 tcpi_rwnd_limited;
+	__u64 tcpi_sndbuf_limited;
+	__u32 tcpi_dsack_dups;
 };
 
 #ifdef CONFIG_MPTCP
@@ -286,6 +290,14 @@ struct tcp_md5sig {
 	__u16	tcpm_keylen;				/* key length */
 	__u32	__tcpm_pad2;				/* zero */
 	__u8	tcpm_key[TCP_MD5SIG_MAXKEYLEN];		/* key (binary) */
+};
+
+enum {
+	TCP_NLA_PAD,
+	TCP_NLA_BUSY,
+	TCP_NLA_RWND_LIMITED,
+	TCP_NLA_SNDBUF_LIMITED,
+	TCP_NLA_DSACK_DUPS,
 };
 
 #endif /* _UAPI_LINUX_TCP_H */

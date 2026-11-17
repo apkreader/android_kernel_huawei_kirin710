@@ -20,7 +20,7 @@ static DEFINE_SPINLOCK(tcp_cong_list_lock);
 static LIST_HEAD(tcp_cong_list);
 
 /* Simple linear search, don't expect many entries! */
-static struct tcp_congestion_ops *tcp_ca_find(const char *name)
+struct tcp_congestion_ops *tcp_ca_find(const char *name)
 {
 	struct tcp_congestion_ops *e;
 
@@ -333,7 +333,8 @@ out:
 }
 
 /* Change congestion control for socket */
-int tcp_set_congestion_control(struct sock *sk, const char *name)
+int tcp_set_congestion_control_flags(struct sock *sk, const char *name,
+				     bool load, bool cap_net_admin)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	const struct tcp_congestion_ops *ca;
@@ -343,7 +344,7 @@ int tcp_set_congestion_control(struct sock *sk, const char *name)
 		return -EPERM;
 
 	rcu_read_lock();
-	ca = __tcp_ca_find_autoload(name);
+	ca = load ? __tcp_ca_find_autoload(name) : tcp_ca_find(name);
 	/* No change asking for existing value */
 	if (ca == icsk->icsk_ca_ops) {
 		icsk->icsk_ca_setsockopt = 1;
@@ -352,7 +353,7 @@ int tcp_set_congestion_control(struct sock *sk, const char *name)
 	if (!ca)
 		err = -ENOENT;
 	else if (!((ca->flags & TCP_CONG_NON_RESTRICTED) ||
-		   ns_capable(sock_net(sk)->user_ns, CAP_NET_ADMIN)))
+		   cap_net_admin))
 		err = -EPERM;
 	else if (!try_module_get(ca->owner))
 		err = -EBUSY;
@@ -361,6 +362,12 @@ int tcp_set_congestion_control(struct sock *sk, const char *name)
  out:
 	rcu_read_unlock();
 	return err;
+}
+
+int tcp_set_congestion_control(struct sock *sk, const char *name)
+{
+	return tcp_set_congestion_control_flags(sk, name, true,
+			ns_capable(sock_net(sk)->user_ns, CAP_NET_ADMIN));
 }
 
 /* Slow start is used when congestion window is no greater than the slow start

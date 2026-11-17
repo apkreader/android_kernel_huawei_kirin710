@@ -74,6 +74,7 @@ extern struct nsproxy init_nsproxy;
 extern struct group_info init_groups;
 
 #define INIT_STRUCT_PID {						\
+	.wait_pidfd = __WAIT_QUEUE_HEAD_INITIALIZER(init_struct_pid.wait_pidfd), \
 	.count 		= ATOMIC_INIT(1),				\
 	.tasks		= {						\
 		{ .first = NULL },					\

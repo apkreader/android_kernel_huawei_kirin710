@@ -28,6 +28,7 @@ struct ping_group_range {
 };
 
 struct netns_ipv4 {
+	int sysctl_tcp_migrate_req;
 #ifdef CONFIG_SYSCTL
 	struct ctl_table_header	*forw_hdr;
 	struct ctl_table_header	*frags_hdr;

@@ -2374,6 +2374,11 @@ struct task_struct {
 #ifdef CONFIG_HISI_SWAP_ZDATA
 	struct reclaim_result *proc_reclaimed_result;
 #endif
+#ifdef CONFIG_BPF_SYSCALL
+	struct bpf_local_storage __rcu *bpf_storage;
+	struct bpf_run_ctx *bpf_ctx;
+#endif
+
 /* CPU-specific state of this task */
 	struct thread_struct thread;
 /*

@@ -244,4 +244,6 @@ void *dma_buf_vmap(struct dma_buf *);
 void dma_buf_vunmap(struct dma_buf *, void *vaddr);
 int is_dma_buf_file(struct file *file);
 struct dma_buf * file_to_dma_buf(struct file *file);
+struct dma_buf *dma_buf_iter_begin(void);
+struct dma_buf *dma_buf_iter_next(struct dma_buf *dmabuf);
 #endif /* __DMA_BUF_H__ */

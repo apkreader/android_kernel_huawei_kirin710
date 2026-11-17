@@ -2,6 +2,7 @@
 #define _LINUX_PID_H
 
 #include <linux/rcupdate.h>
+#include <linux/wait.h>
 
 enum pid_type
 {
@@ -58,6 +59,7 @@ struct upid {
 
 struct pid
 {
+	wait_queue_head_t wait_pidfd;
 	atomic_t count;
 	unsigned int level;
 	/* lists of tasks that use this pid */
@@ -81,6 +83,8 @@ static inline struct pid *get_pid(struct pid *pid)
 	return pid;
 }
 
+extern const struct file_operations pidfd_fops;
+struct pid *pidfd_get_pid(unsigned int fd, unsigned int *flags);
 extern void put_pid(struct pid *pid);
 extern struct task_struct *pid_task(struct pid *pid, enum pid_type);
 extern struct task_struct *get_pid_task(struct pid *pid, enum pid_type);

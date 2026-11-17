@@ -352,7 +352,9 @@ struct vfs_cap_data {
 #define CAP_PERFMON		38
 #define CAP_PERF_EVENT		CAP_PERFMON
 
-#define CAP_LAST_CAP         CAP_PERFMON
+#define CAP_BPF			39
+
+#define CAP_LAST_CAP         CAP_BPF
 
 #define cap_valid(x) ((x) >= 0 && (x) <= CAP_LAST_CAP)
 

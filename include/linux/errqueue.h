@@ -19,6 +19,7 @@ struct sock_exterr_skb {
 	} header;
 	struct sock_extended_err	ee;
 	u16				addr_offset;
+	bool opt_stats;
 	__be16				port;
 };
 

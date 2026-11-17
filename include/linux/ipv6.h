@@ -66,6 +66,11 @@ struct ipv6_devconf {
 	} stable_secret;
 	__s32		use_oif_addrs_only;
 	__s32		keep_addr_on_down;
+	__s32		seg6_enabled;
+	__u32		addr_gen_mode;
+#ifdef CONFIG_IPV6_SEG6_HMAC
+        __s32           seg6_require_hmac;
+#endif
 
 	struct ctl_table_header *sysctl_header;
 };
@@ -144,6 +149,16 @@ static inline int inet6_iif(const struct sk_buff *skb)
 	bool l3_slave = ipv6_l3mdev_skb(IP6CB(skb)->flags);
 
 	return l3_slave ? skb->skb_iif : IP6CB(skb)->iif;
+}
+
+/* can not be used in TCP layer after tcp_v6_fill_cb */
+static inline int inet6_sdif(const struct sk_buff *skb)
+{
+#if IS_ENABLED(CONFIG_NET_L3_MASTER_DEV)
+	if (skb && ipv6_l3mdev_skb(IP6CB(skb)->flags))
+		return IP6CB(skb)->iif;
+#endif
+	return 0;
 }
 
 /* can not be used in TCP layer after tcp_v6_fill_cb */

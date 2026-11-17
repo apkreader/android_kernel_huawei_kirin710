@@ -11,6 +11,7 @@
 
 #include <net/flow.h>
 #include <net/netns/core.h>
+#include <net/netns/bpf.h>
 #include <net/netns/mib.h>
 #include <net/netns/unix.h>
 #include <net/netns/packet.h>
@@ -137,6 +138,8 @@ struct net {
 	struct sk_buff_head	wext_nlevents;
 #endif
 	struct net_generic __rcu	*gen;
+	struct netns_bpf bpf;
+
 
 	/* Note : following structs are cache line aligned */
 #ifdef CONFIG_XFRM
@@ -226,6 +229,7 @@ static inline int check_net(const struct net *net)
 }
 
 void net_drop_ns(void *);
+u64 net_gen_cookie(struct net *net);
 
 #else
 
@@ -252,6 +256,11 @@ int net_eq(const struct net *net1, const struct net *net2)
 static inline int check_net(const struct net *net)
 {
 	return 1;
+}
+
+static inline u64 net_gen_cookie(struct net *net)
+{
+	return 0;
 }
 
 #define net_drop_ns NULL

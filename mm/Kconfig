@@ -866,3 +866,6 @@ config SPECULATIVE_PAGE_FAULT
 	 is then tried.
 
 source "mm/hisi/Kconfig"
+
+config ARCH_HAS_SET_MEMORY
+	bool

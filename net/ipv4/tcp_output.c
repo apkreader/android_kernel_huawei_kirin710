@@ -34,6 +34,9 @@
  *
  */
 
+
+
+
 #define pr_fmt(fmt) "TCP: " fmt
 #ifdef CONFIG_MPTCP
 #include <net/mptcp.h>
@@ -44,6 +47,48 @@
 #include <net/ipv6.h>
 #endif
 #include <net/tcp.h>
+
+static void tcp_chrono_set(struct tcp_sock *tp, const enum tcp_chrono new)
+{
+	const u32 now = tcp_time_stamp;
+
+	if (tp->chrono_type > TCP_CHRONO_UNSPEC)
+		tp->chrono_stat[tp->chrono_type - 1] += now - tp->chrono_start;
+	tp->chrono_start = now;
+	tp->chrono_type = new;
+}
+
+void tcp_chrono_start(struct sock *sk, const enum tcp_chrono type)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	/* If there are multiple conditions worthy of tracking in a
+	 * chronograph then the highest priority enum takes precedence
+	 * over the other conditions. So that if something "more interesting"
+	 * starts happening, stop the previous chrono and start a new one.
+	 */
+	if (type > tp->chrono_type)
+		tcp_chrono_set(tp, type);
+}
+
+void tcp_chrono_stop(struct sock *sk, const enum tcp_chrono type)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+
+	/* There are multiple conditions worthy of tracking in a
+	 * chronograph, so that the highest priority enum takes
+	 * precedence over the other conditions (see tcp_chrono_start).
+	 * If a condition stops, we only stop chrono tracking if
+	 * it's the "most interesting" or current chrono we are
+	 * tracking and starts busy chrono if we have pending data.
+	 */
+	if (tcp_write_queue_empty(sk))
+		tcp_chrono_set(tp, TCP_CHRONO_UNSPEC);
+	else if (type == tp->chrono_type)
+		tcp_chrono_set(tp, TCP_CHRONO_BUSY);
+}
+
 
 #include <linux/compiler.h>
 #include <linux/gfp.h>
@@ -900,11 +945,12 @@ exit:
 			tcp_tsq_handler(sk);
 		} else {
 			/* defer the work to tcp_release_cb() */
-			set_bit(TCP_TSQ_DEFERRED, &tp->tsq_flags);
+			set_bit(TCP_TSQ_DEFERRED, &sk->sk_tsq_flags);
 		}
 		bh_unlock_sock(sk);
 #endif
-		clear_bit(TSQ_QUEUED, &tp->tsq_flags);
+
+		clear_bit(TSQ_QUEUED, &sk->sk_tsq_flags);
 		sk_free(sk);
 	}
 }
@@ -932,16 +978,15 @@ exit:
  */
 void tcp_release_cb(struct sock *sk)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
 	unsigned long flags, nflags;
 
 	/* perform an atomic operation only if at least one flag is set */
 	do {
-		flags = tp->tsq_flags;
+		flags = sk->sk_tsq_flags;
 		if (!(flags & TCP_DEFERRED_ALL))
 			return;
 		nflags = flags & ~TCP_DEFERRED_ALL;
-	} while (cmpxchg(&tp->tsq_flags, flags, nflags) != flags);
+	} while (cmpxchg(&sk->sk_tsq_flags, flags, nflags) != flags);
 
 	if (flags & (1UL << TCP_TSQ_DEFERRED))
 		tcp_tsq_handler(sk);
@@ -1028,8 +1073,8 @@ void tcp_wfree(struct sk_buff *skb)
 	if (wmem >= SKB_TRUESIZE(1) && this_cpu_ksoftirqd() == current)
 		goto out;
 
-	if (test_and_clear_bit(TSQ_THROTTLED, &tp->tsq_flags) &&
-	    !test_and_set_bit(TSQ_QUEUED, &tp->tsq_flags)) {
+	if (test_and_clear_bit(TSQ_THROTTLED, &sk->sk_tsq_flags) &&
+	    !test_and_set_bit(TSQ_QUEUED, &sk->sk_tsq_flags)) {
 		unsigned long flags;
 		struct tsq_tasklet *tsq;
 
@@ -2334,7 +2379,7 @@ static bool tcp_small_queue_check(struct sock *sk, const struct sk_buff *skb,
 	limit <<= factor;
 
 	if (atomic_read(&sk->sk_wmem_alloc) > limit) {
-		set_bit(TSQ_THROTTLED, &tcp_sk(sk)->tsq_flags);
+		set_bit(TSQ_THROTTLED, &sk->sk_tsq_flags);
 		/* It is possible TX completion already happened
 		 * before we set TSQ_THROTTLED, so we must
 		 * test again the condition.
@@ -3848,8 +3893,6 @@ void __tcp_send_ack(struct sock *sk, u32 rcv_nxt)
 	/* We do not want pure acks influencing TCP Small Queues or fq/pacing
 	 * too much.
 	 * SKB_TRUESIZE(max(1 .. 66, MAX_TCP_HEADER)) is unfortunately ~784
-	 * We also avoid tcp_wfree() overhead (cache line miss accessing
-	 * tp->tsq_flags) by using regular sock_wfree()
 	 */
 	skb_set_tcp_pure_ack(buff);
 #ifdef CONFIG_WIFI_DELAY_STATISTIC

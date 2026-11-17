@@ -1,4 +1,5 @@
 config ARM64
+	select ARCH_HAS_SET_MEMORY
 	def_bool y
 	select ACPI_CCA_REQUIRED if ACPI
 	select ACPI_GENERIC_GSI if ACPI

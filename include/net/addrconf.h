@@ -94,6 +94,7 @@ int ipv4_rcv_saddr_equal(const struct sock *sk, const struct sock *sk2,
 			 bool match_wildcard);
 int ipv6_rcv_saddr_equal(const struct sock *sk, const struct sock *sk2,
 			 bool match_wildcard);
+int inet_rcv_saddr_any(const struct sock *sk);
 void addrconf_join_solict(struct net_device *dev, const struct in6_addr *addr);
 void addrconf_leave_solict(struct inet6_dev *idev, const struct in6_addr *addr);
 
@@ -208,6 +209,11 @@ struct ipv6_stub {
 				 const struct in6_addr *addr);
 	int (*ipv6_dst_lookup)(struct net *net, struct sock *sk,
 			       struct dst_entry **dst, struct flowi6 *fl6);
+	struct dst_entry *(*ipv6_dst_lookup_flow)(struct net *net,
+						  const struct sock *sk,
+						  struct flowi6 *fl6,
+						  const struct in6_addr *final_dst);
+	int (*ipv6_route_input)(struct sk_buff *skb);
 	void (*udpv6_encap_enable)(void);
 	void (*ndisc_send_na)(struct net_device *dev, const struct in6_addr *daddr,
 			      const struct in6_addr *solicited_addr,
@@ -215,6 +221,13 @@ struct ipv6_stub {
 	struct neigh_table *nd_tbl;
 };
 extern const struct ipv6_stub *ipv6_stub __read_mostly;
+
+/* A stub used by bpf helpers. Similarly ugly as ipv6_stub */
+struct ipv6_bpf_stub {
+	int (*inet6_bind)(struct sock *sk, struct sockaddr *uaddr, int addr_len,
+			  u32 flags);
+};
+extern const struct ipv6_bpf_stub *ipv6_bpf_stub __read_mostly;
 
 /*
  * identify MLD packets for MLD filter exceptions
@@ -284,6 +297,20 @@ static inline struct inet6_dev *__in6_dev_get(const struct net_device *dev)
 }
 
 /**
+ * __in6_dev_get_safely - get inet6_dev pointer from netdevice
+ * @dev: network device
+ *
+ * This is a safer version of __in6_dev_get
+ */
+static inline struct inet6_dev *__in6_dev_get_safely(const struct net_device *dev)
+{
+	if (likely(dev))
+		return rcu_dereference_rtnl(dev->ip6_ptr);
+	else
+		return NULL;
+}
+
+/**
  * in6_dev_get - get inet6_dev pointer from netdevice
  * @dev: network device
  *
@@ -316,6 +343,16 @@ static inline void in6_dev_put(struct inet6_dev *idev)
 {
 	if (atomic_dec_and_test(&idev->refcnt))
 		in6_dev_finish_destroy(idev);
+}
+
+static inline void in6_dev_put_clear(struct inet6_dev **pidev)
+{
+	struct inet6_dev *idev = *pidev;
+
+	if (idev) {
+		in6_dev_put(idev);
+		*pidev = NULL;
+	}
 }
 
 static inline void __in6_dev_put(struct inet6_dev *idev)
