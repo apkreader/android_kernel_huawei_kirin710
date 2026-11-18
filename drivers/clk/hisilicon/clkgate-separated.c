@@ -115,20 +115,26 @@ struct clk *hisi_register_clkgate_sep(struct device *dev, const char *name,
 }
 
 #ifdef CONFIG_OF
-static void __init kirin710_ufs_gate_setup(struct device_node *np)
+static void __init kirin710_gate_setup(struct device_node *np)
 {
 	struct device_node *parent;
 	struct resource res;
 	void __iomem *base;
-	const char *name, *parent_name;
+	const char *name, *parent_name, *parent_compatible;
 	struct clk_hw *hw;
 	struct clk *clk;
 	u32 gate[2];
 	int ret;
 
 	if (!of_machine_is_compatible("hisilicon,kirin710") ||
-	    of_property_read_string(np, "clock-output-names", &name) ||
-	    strcmp(name, "clk_ufsio_ref"))
+	    of_property_read_string(np, "clock-output-names", &name))
+		return;
+
+	if (!strcmp(name, "clk_ufsio_ref"))
+		parent_compatible = "hisilicon,clk-sctrl";
+	else if (!strcmp(name, "clk_usb2otg_ref") || !strcmp(name, "clk_usb2otg"))
+		parent_compatible = "hisilicon,clk-crgctrl";
+	else
 		return;
 
 	parent_name = of_clk_get_parent_name(np, 0);
@@ -141,7 +147,7 @@ static void __init kirin710_ufs_gate_setup(struct device_node *np)
 	if (!parent)
 		return;
 
-	ret = of_device_is_compatible(parent, "hisilicon,clk-sctrl") ?
+	ret = of_device_is_compatible(parent, parent_compatible) ?
 		of_address_to_resource(parent, 0, &res) : -EINVAL;
 	of_node_put(parent);
 	if (ret || (u64)gate[0] + CLKGATE_SEPERATED_STATUS + sizeof(u32) >
@@ -168,8 +174,8 @@ static void __init kirin710_ufs_gate_setup(struct device_node *np)
 	}
 
 	iounmap(base);
-	pr_err("%pOF: failed to register UFS reference clock: %d\n", np, ret);
+	pr_err("%pOF: failed to register clock: %d\n", np, ret);
 }
-CLK_OF_DECLARE(kirin710_ufs_gate, "hisilicon,hi3xxx-clk-gate",
-	       kirin710_ufs_gate_setup);
+CLK_OF_DECLARE(kirin710_gate, "hisilicon,hi3xxx-clk-gate",
+	       kirin710_gate_setup);
 #endif
