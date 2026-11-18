@@ -12,6 +12,7 @@
 #include <linux/mailbox_controller.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 
@@ -215,7 +216,11 @@ static struct mbox_chan *hi3660_mbox_xlate(struct mbox_controller *controller,
 	struct hi3660_chan_info *mchan;
 	unsigned int ch = spec->args[0];
 
-	if (ch >= MBOX_CHAN_MAX) {
+	if (of_device_is_compatible(mbox->dev->of_node, "hisilicon,HiIPCV230"))
+		return ERR_PTR(-EINVAL);
+
+	if (spec->args_count != 3 || ch >= MBOX_CHAN_MAX ||
+	    spec->args[1] >= 32 || spec->args[2] >= 32) {
 		dev_err(mbox->dev, "Invalid channel idx %d\n", ch);
 		return ERR_PTR(-EINVAL);
 	}
@@ -227,8 +232,48 @@ static struct mbox_chan *hi3660_mbox_xlate(struct mbox_controller *controller,
 	return &mbox->chan[ch];
 }
 
+static int hi3660_mbox_parse_kirin710(struct hi3660_mbox *mbox)
+{
+	struct device_node *np = mbox->dev->of_node;
+	struct resource res;
+	u32 key, words;
+	int ret;
+
+	if (!of_machine_is_compatible("hisilicon,kirin710"))
+		return -ENODEV;
+
+	ret = of_address_to_resource(np, 0, &res);
+	if (ret)
+		return ret;
+	if (resource_size(&res) < MBOX_IPC_LOCK_REG + sizeof(u32) ||
+	    of_property_read_u32(np, "unlock_key", &key) ||
+	    of_property_read_u32(np, "capability", &words) ||
+	    key != MBOX_IPC_UNLOCK || words != MBOX_MSG_LEN)
+		return -EINVAL;
+
+	for_each_available_child_of_node_scoped(np, child) {
+		u32 index, src, dst, used;
+
+		if (!of_device_is_compatible(child, "HiIPCV230,tx-mailbox-fast") ||
+		    of_property_read_u32(child, "used", &used) || !used)
+			continue;
+		if (of_property_read_u32(child, "index", &index) ||
+		    of_property_read_u32(child, "src_bit", &src) ||
+		    of_property_read_u32(child, "des_bit", &dst) ||
+		    index >= MBOX_CHAN_MAX || src >= 32 || dst >= 32 ||
+		    src == dst)
+			return -EINVAL;
+
+		mbox->mchan[index].dst_irq = dst;
+		mbox->mchan[index].ack_irq = src;
+	}
+
+	return 0;
+}
+
 static const struct of_device_id hi3660_mbox_of_match[] = {
 	{ .compatible = "hisilicon,hi3660-mbox", },
+	{ .compatible = "hisilicon,HiIPCV230", },
 	{},
 };
 
@@ -251,6 +296,12 @@ static int hi3660_mbox_probe(struct platform_device *pdev)
 		return PTR_ERR(mbox->base);
 
 	mbox->dev = dev;
+	if (of_device_is_compatible(dev->of_node, "hisilicon,HiIPCV230")) {
+		err = hi3660_mbox_parse_kirin710(mbox);
+		if (err)
+			return err;
+	}
+
 	mbox->controller.dev = dev;
 	mbox->controller.chans = mbox->chan;
 	mbox->controller.num_chans = MBOX_CHAN_MAX;
