@@ -115,6 +115,48 @@ struct clk *hisi_register_clkgate_sep(struct device *dev, const char *name,
 }
 
 #ifdef CONFIG_OF
+static void __init kirin710_register_passthrough(struct device_node *np,
+					       const char *name,
+					       const char *parent)
+{
+	struct clk_hw *hw;
+	int ret;
+
+	hw = clk_hw_register_fixed_factor(NULL, name, parent, 0, 1, 1);
+	if (IS_ERR(hw)) {
+		pr_err("%pOF: failed to register clock: %ld\n", np, PTR_ERR(hw));
+		return;
+	}
+
+	ret = of_clk_add_hw_provider(np, of_clk_hw_simple_get, hw);
+	if (ret) {
+		clk_hw_unregister_fixed_factor(hw);
+		pr_err("%pOF: failed to register clock provider: %d\n", np, ret);
+	}
+}
+
+static void __init kirin710_ppll0_setup(struct device_node *np)
+{
+	const char *name, *parent;
+	u32 enable[2], disable[2];
+
+	if (!of_machine_is_compatible("hisilicon,kirin710") ||
+	    of_property_read_string(np, "clock-output-names", &name) ||
+	    strcmp(name, "clk_ap_ppll0") ||
+	    of_property_read_u32_array(np, "hisilicon,ipc-lpm3-cmd-en", enable, 2) ||
+	    of_property_read_u32_array(np, "hisilicon,ipc-lpm3-cmd-dis", disable, 2) ||
+	    enable[1] || disable[1])
+		return;
+
+	parent = of_clk_get_parent_name(np, 0);
+	if (!parent)
+		return;
+
+	/* Firmware leaves PPLL0 running. Its enable and disable are no-ops. */
+	kirin710_register_passthrough(np, name, parent);
+}
+CLK_OF_DECLARE(kirin710_ppll0, "hisilicon,ppll-ctrl", kirin710_ppll0_setup);
+
 static void __init kirin710_gate_setup(struct device_node *np)
 {
 	struct device_node *parent;
@@ -158,16 +200,7 @@ static void __init kirin710_gate_setup(struct device_node *np)
 
 	/* The firmware uses a zero mask for the bus clock's pass-through. */
 	if (!gate[1]) {
-		hw = clk_hw_register_fixed_factor(NULL, name, parent_name, 0, 1, 1);
-		if (IS_ERR(hw)) {
-			pr_err("%pOF: failed to register clock: %ld\n", np, PTR_ERR(hw));
-			return;
-		}
-		ret = of_clk_add_hw_provider(np, of_clk_hw_simple_get, hw);
-		if (ret) {
-			clk_hw_unregister_fixed_factor(hw);
-			pr_err("%pOF: failed to register clock provider: %d\n", np, ret);
-		}
+		kirin710_register_passthrough(np, name, parent_name);
 		return;
 	}
 
