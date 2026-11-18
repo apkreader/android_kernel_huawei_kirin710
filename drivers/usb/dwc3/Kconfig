@@ -189,4 +189,10 @@ config USB_DWC3_RTK
 	  or dual-role mode.
 	  Say 'Y' or 'M' if you have such device.
 
+config USB_DWC3_KIRIN710
+	tristate "Kirin 710 DWC3 glue"
+	depends on ARCH_HISI && OF && COMMON_CLK_KIRIN710_USB
+	help
+	  Power up the USB 2.0 PHY and DWC3 controller on Kirin 710.
+
 endif
