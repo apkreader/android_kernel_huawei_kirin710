@@ -557,9 +557,164 @@ static const struct ufs_hba_variant_ops ufs_hba_hi3670_vops = {
 	.resume = ufs_hisi_resume,
 };
 
+/* Libra controller and system-controller registers. */
+#define LIBRA_UFS_UMECTRL		0x64
+#define LIBRA_UFS_CRG_CFG		0x7c
+#define LIBRA_UFS_AXI_WRITE_QOS		0x84
+#define LIBRA_UFS_AXI_READ_QOS		0x88
+#define LIBRA_SCTRL_DEEPSLEEPED		0x008
+#define LIBRA_SCTRL_CLK_ENABLE		0x1b0
+#define LIBRA_SCTRL_CLK_DISABLE		0x1b4
+#define LIBRA_SCTRL_CLKDIV9		0x274
+#define LIBRA_UFS_SUBSYS_CLOCK		BIT(14)
+#define LIBRA_UFS_RST			BIT(0)
+#define LIBRA_UFS_ARST			BIT(1)
+
+static int ufs_kirin710_init(struct ufs_hba *hba)
+{
+	struct device *dev = hba->dev;
+	struct ufs_hisi_host *host;
+	struct device_node *np;
+	void __iomem *sctrl;
+	u32 val;
+	int ret;
+
+	host = devm_kzalloc(dev, sizeof(*host), GFP_KERNEL);
+	if (!host)
+		return -ENOMEM;
+	host->hba = hba;
+
+	ret = ufs_hisi_get_resource(host);
+	if (ret)
+		return ret;
+
+	np = of_find_compatible_node(NULL, NULL, "hisilicon,sysctrl");
+	if (!np)
+		return -ENODEV;
+	sctrl = of_iomap(np, 0);
+	of_node_put(np);
+	if (!sctrl)
+		return -ENOMEM;
+
+	/* Set the UFS subsystem clock to 202 MHz before releasing reset. */
+	writel(LIBRA_UFS_SUBSYS_CLOCK, sctrl + LIBRA_SCTRL_CLK_DISABLE);
+	writel(0x003f0007, sctrl + LIBRA_SCTRL_CLKDIV9);
+	writel(LIBRA_UFS_SUBSYS_CLOCK, sctrl + LIBRA_SCTRL_CLK_ENABLE);
+	val = readl(sctrl + LIBRA_SCTRL_DEEPSLEEPED);
+	iounmap(sctrl);
+
+	ufs_sys_ctrl_writel(host, BIT(0), LIBRA_UFS_UMECTRL);
+	ufs_sys_ctrl_writel(host, LIBRA_UFS_RST << 16, LIBRA_UFS_CRG_CFG);
+	if (val & BIT(22))
+		ufs_sys_ctrl_writel(host, BIT(27) | BIT(11), UFS_DEVICE_RESET_CTRL);
+
+	ufs_sys_ctrl_set_bits(host, BIT_UFS_PSW_MTCMOS_EN, PSW_POWER_CTRL);
+	udelay(10);
+	ufs_sys_ctrl_set_bits(host, BIT_SYSCTRL_PWR_READY, HC_LP_CTRL);
+	ufs_sys_ctrl_clr_bits(host, BIT_SYSCTRL_REF_CLOCK_EN, PHY_CLK_CTRL);
+	ufs_sys_ctrl_writel(host, (7 << 18) | (3 << 2), LIBRA_UFS_CRG_CFG);
+	val = ufs_sys_ctrl_readl(host, PHY_CLK_CTRL);
+	val &= ~(MASK_SYSCTRL_REF_CLOCK_SEL | MASK_SYSCTRL_CFG_CLOCK_FREQ);
+	ufs_sys_ctrl_writel(host, val | 0x32, PHY_CLK_CTRL);
+	ufs_sys_ctrl_writel(host, 0x00300030, UFS_DEVICE_RESET_CTRL);
+
+	ufs_sys_ctrl_set_bits(host, MASK_UFS_CLK_GATE_BYPASS, CLOCK_GATE_BYPASS);
+	ufs_sys_ctrl_set_bits(host, MASK_UFS_SYSCRTL_BYPASS, UFS_SYSCTRL);
+	ufs_sys_ctrl_set_bits(host, BIT_SYSCTRL_PSW_CLK_EN, PSW_CLK_CTRL);
+	ufs_sys_ctrl_clr_bits(host, BIT_UFS_PSW_ISO_CTRL, PSW_POWER_CTRL);
+	ufs_sys_ctrl_clr_bits(host, BIT_UFS_PHY_ISO_CTRL, PHY_ISO_EN);
+	ufs_sys_ctrl_clr_bits(host, BIT_SYSCTRL_LP_ISOL_EN, HC_LP_CTRL);
+	ufs_sys_ctrl_writel(host, (LIBRA_UFS_ARST << 16) | LIBRA_UFS_ARST,
+			    LIBRA_UFS_CRG_CFG);
+	ufs_sys_ctrl_set_bits(host, BIT_SYSCTRL_LP_RESET_N, RESET_CTRL_EN);
+	usleep_range(1000, 1500);
+	ufs_sys_ctrl_set_bits(host, BIT_SYSCTRL_REF_CLOCK_EN, PHY_CLK_CTRL);
+	ufs_sys_ctrl_writel(host, MASK_UFS_DEVICE_RESET, UFS_DEVICE_RESET_CTRL);
+	usleep_range(1000, 1500);
+	ufs_sys_ctrl_writel(host, MASK_UFS_DEVICE_RESET | BIT_UFS_DEVICE_RESET,
+			    UFS_DEVICE_RESET_CTRL);
+	msleep(10);
+	ufs_sys_ctrl_writel(host, (LIBRA_UFS_RST << 16) | LIBRA_UFS_RST,
+			    LIBRA_UFS_CRG_CFG);
+	usleep_range(1000, 1500);
+	ufs_sys_ctrl_writel(host, 0x80700040, LIBRA_UFS_AXI_WRITE_QOS);
+	ufs_sys_ctrl_writel(host, 0x80700040, LIBRA_UFS_AXI_READ_QOS);
+
+	ufshcd_set_variant(hba, host);
+	hba->quirks |= UFSHCI_QUIRK_BROKEN_HCE | UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8;
+	hba->rpm_lvl = UFS_PM_LVL_0;
+	hba->spm_lvl = UFS_PM_LVL_0;
+
+	return 0;
+}
+
+static int ufs_kirin710_link_startup(struct ufs_hba *hba,
+				    enum ufs_notify_change_status status)
+{
+	static const struct {
+		u16 attr;
+		u8 lane;
+		u8 value;
+	} rate_b[] = {
+		{ 0x156a, 0, 2 }, { 0x8114, 0, 1 },
+		{ 0x8121, 0, 0x2d }, { 0x8122, 0, 1 },
+		{ 0xd085, 0, 1 },
+		{ 0x800d, 4, 0x58 }, { 0x800d, 5, 0x58 },
+		{ 0x800e, 4, 0x0b }, { 0x800e, 5, 0x0b },
+		{ 0x8009, 4, 1 }, { 0x8009, 5, 1 },
+		{ 0xd085, 0, 1 }, { 0x8113, 0, 1 }, { 0xd085, 0, 1 },
+		{ 0x0092, 4, 0x0a }, { 0x0092, 5, 0x0a },
+		{ 0x008f, 4, 0x0a }, { 0x008f, 5, 0x0a },
+		{ 0x0095, 4, 0x4f }, { 0x0095, 5, 0x4f },
+		{ 0x0094, 4, 0x4f }, { 0x0094, 5, 0x4f },
+		{ 0x008b, 4, 0x4f }, { 0x008b, 5, 0x4f },
+		{ 0x000f, 0, 5 }, { 0x000f, 1, 5 }, { 0xd085, 0, 1 },
+	};
+	int ret, enable_ret;
+	unsigned int i;
+
+	if (status != PRE_CHANGE)
+		return ufs_hisi_link_startup_notify(hba, status);
+
+	/* Stock Libra firmware selects the Synopsys Rate B PHY settings. */
+	if (!of_property_read_bool(hba->dev->of_node, "ufs-kirin-use-rate-B"))
+		return -EINVAL;
+
+	ret = ufshcd_dme_set(hba, UIC_ARG_MIB(0xd0c1), 1);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ARRAY_SIZE(rate_b); i++) {
+		ret = ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(rate_b[i].attr,
+							rate_b[i].lane),
+				     rate_b[i].value);
+		if (ret)
+			break;
+	}
+
+	enable_ret = ufshcd_dme_set(hba, UIC_ARG_MIB(0xd0c1), 0);
+	if (ret || enable_ret)
+		return ret ?: enable_ret;
+
+	ret = ufs_hisi_check_hibern8(hba);
+	if (ret)
+		return ret;
+	ret = ufshcd_dme_set(hba, UIC_ARG_MIB(0x155e), 0);
+	if (ret)
+		return ret;
+	return ufshcd_dme_set(hba, UIC_ARG_MIB(0xd0ab), 0);
+}
+
+static const struct ufs_hba_variant_ops ufs_hba_kirin710_vops = {
+	.name = "kirin710",
+	.init = ufs_kirin710_init,
+	.link_startup_notify = ufs_kirin710_link_startup,
+};
+
 static const struct of_device_id ufs_hisi_of_match[] = {
 	{ .compatible = "hisilicon,hi3660-ufs", .data = &ufs_hba_hi3660_vops },
 	{ .compatible = "hisilicon,hi3670-ufs", .data = &ufs_hba_hi3670_vops },
+	{ .compatible = "hisilicon,kirin-ufs", .data = &ufs_hba_kirin710_vops },
 	{},
 };
 
@@ -570,6 +725,10 @@ static int ufs_hisi_probe(struct platform_device *pdev)
 	const struct of_device_id *of_id;
 
 	of_id = of_match_node(ufs_hisi_of_match, pdev->dev.of_node);
+
+	if (of_id->data == &ufs_hba_kirin710_vops &&
+	    !of_machine_is_compatible("hisilicon,kirin710"))
+		return -ENODEV;
 
 	return ufshcd_pltfrm_init(pdev, of_id->data);
 }
