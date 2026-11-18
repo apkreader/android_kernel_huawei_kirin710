@@ -63,4 +63,10 @@ config HSEM_U8500
 
 	  If unsure, say N.
 
+config HWSPINLOCK_HISI
+	tristate "HiSilicon Kirin hardware spinlocks"
+	depends on ARCH_HISI && OF
+	help
+	  Hardware locks shared between the Kirin application CPUs and firmware.
+
 endif # HWSPINLOCK
