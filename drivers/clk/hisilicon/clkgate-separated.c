@@ -12,6 +12,8 @@
 #include <linux/kernel.h>
 #include <linux/clk-provider.h>
 #include <linux/io.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/slab.h>
 
 #include "clk.h"
@@ -111,3 +113,63 @@ struct clk *hisi_register_clkgate_sep(struct device *dev, const char *name,
 		kfree(sclk);
 	return clk;
 }
+
+#ifdef CONFIG_OF
+static void __init kirin710_ufs_gate_setup(struct device_node *np)
+{
+	struct device_node *parent;
+	struct resource res;
+	void __iomem *base;
+	const char *name, *parent_name;
+	struct clk_hw *hw;
+	struct clk *clk;
+	u32 gate[2];
+	int ret;
+
+	if (!of_machine_is_compatible("hisilicon,kirin710") ||
+	    of_property_read_string(np, "clock-output-names", &name) ||
+	    strcmp(name, "clk_ufsio_ref"))
+		return;
+
+	parent_name = of_clk_get_parent_name(np, 0);
+	if (!parent_name ||
+	    of_property_read_u32_array(np, "hisilicon,hi3xxx-clkgate", gate, 2) ||
+	    !gate[1] || (gate[1] & (gate[1] - 1)) || (gate[0] & 3))
+		return;
+
+	parent = of_get_parent(np);
+	if (!parent)
+		return;
+
+	ret = of_device_is_compatible(parent, "hisilicon,clk-sctrl") ?
+		of_address_to_resource(parent, 0, &res) : -EINVAL;
+	of_node_put(parent);
+	if (ret || (u64)gate[0] + CLKGATE_SEPERATED_STATUS + sizeof(u32) >
+	    resource_size(&res))
+		return;
+
+	base = ioremap(res.start, resource_size(&res));
+	if (!base)
+		return;
+
+	clk = hisi_register_clkgate_sep(NULL, name, parent_name,
+				       CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
+				       base + gate[0], __ffs(gate[1]), 0, NULL);
+	if (!IS_ERR(clk)) {
+		hw = __clk_get_hw(clk);
+		ret = of_clk_add_hw_provider(np, of_clk_hw_simple_get, hw);
+		if (!ret)
+			return;
+
+		clk_unregister(clk);
+		kfree(container_of(hw, struct clkgate_separated, hw));
+	} else {
+		ret = PTR_ERR(clk);
+	}
+
+	iounmap(base);
+	pr_err("%pOF: failed to register UFS reference clock: %d\n", np, ret);
+}
+CLK_OF_DECLARE(kirin710_ufs_gate, "hisilicon,hi3xxx-clk-gate",
+	       kirin710_ufs_gate_setup);
+#endif
