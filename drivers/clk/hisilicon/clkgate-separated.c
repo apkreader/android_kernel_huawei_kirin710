@@ -179,22 +179,28 @@ static void __init kirin710_gate_setup(struct device_node *np)
 CLK_OF_DECLARE(kirin710_gate, "hisilicon,hi3xxx-clk-gate",
 	       kirin710_gate_setup);
 
-static void __init kirin710_usb_tcxo_setup(struct device_node *np)
+static void __init kirin710_hiword_gate_setup(struct device_node *np)
 {
 	struct device_node *parent;
 	struct resource res;
 	struct clk_hw *hw;
 	void __iomem *base;
-	const char *name, *parent_name;
+	const char *name, *parent_name, *parent_compatible;
 	u32 gate[2];
 	int ret;
 
 	if (!of_machine_is_compatible("hisilicon,kirin710") ||
 	    of_property_read_string(np, "clock-output-names", &name) ||
-	    strcmp(name, "clk_usb_tcxo_en") ||
 	    !of_property_read_bool(np, "hiword") ||
 	    of_property_read_u32_array(np, "hisilicon,clkgate", gate, 2) ||
 	    (gate[0] & 3) || gate[1] >= 16)
+		return;
+
+	if (!strcmp(name, "clk_usb_tcxo_en"))
+		parent_compatible = "hisilicon,clk-pctrl";
+	else if (!strcmp(name, "autodiv_sysbus"))
+		parent_compatible = "hisilicon,clk-crgctrl";
+	else
 		return;
 
 	parent_name = of_clk_get_parent_name(np, 0);
@@ -204,7 +210,7 @@ static void __init kirin710_usb_tcxo_setup(struct device_node *np)
 	parent = of_get_parent(np);
 	if (!parent)
 		return;
-	ret = of_device_is_compatible(parent, "hisilicon,clk-pctrl") ?
+	ret = of_device_is_compatible(parent, parent_compatible) ?
 		of_address_to_resource(parent, 0, &res) : -EINVAL;
 	of_node_put(parent);
 	if (ret || (u64)gate[0] + sizeof(u32) > resource_size(&res))
@@ -226,7 +232,8 @@ static void __init kirin710_usb_tcxo_setup(struct device_node *np)
 	}
 
 	iounmap(base);
-	pr_err("%pOF: failed to register USB TCXO clock: %d\n", np, ret);
+	pr_err("%pOF: failed to register clock: %d\n", np, ret);
 }
-CLK_OF_DECLARE(kirin710_usb_tcxo, "hisilicon,clk-gate", kirin710_usb_tcxo_setup);
+CLK_OF_DECLARE(kirin710_hiword_gate, "hisilicon,clk-gate",
+	       kirin710_hiword_gate_setup);
 #endif
