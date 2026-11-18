@@ -8,6 +8,16 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 
+#define CRG_BACKUP_ENABLE	0x50
+#define CRG_BACKUP_DISABLE	0x54
+#define CRG_BACKUP_SELECT	0xfc
+#define CRG_BACKUP_DIVIDER	0x108
+#define USB_BACKUP_GATE		BIT(22)
+#define USB_BACKUP_SYS		BIT(6)
+#define USB_BACKUP_PLL		BIT(7)
+#define USB_BACKUP_SELECT	BIT(8)
+#define USB_BACKUP_DIVIDER	GENMASK(15, 10)
+#define CRG_HIWORD(value, mask)	((value) | ((mask) << 16))
 #define CRG_RST_ENABLE		0x60
 #define CRG_RST_DISABLE		0x64
 #define CRG_ISO_DISABLE		0x148
@@ -28,6 +38,7 @@ struct kirin710_dwc3 {
 	struct clk_bulk_data clocks[2];
 	struct clk *tcxo;
 	void __iomem *crg;
+	bool backup_clock;
 };
 
 static void __iomem *kirin710_dwc3_map(struct device *dev, const char *compatible,
@@ -53,6 +64,34 @@ static void __iomem *kirin710_dwc3_map(struct device *dev, const char *compatibl
 	return base ?: ERR_PTR(-ENOMEM);
 }
 
+static int kirin710_dwc3_refclk_enable(struct kirin710_dwc3 *usb,
+				     void __iomem *pctrl)
+{
+	u32 mux = readl(pctrl + PCTRL_PHY_MUX);
+	int ret;
+
+	if (usb->backup_clock) {
+		writel(USB_BACKUP_GATE, usb->crg + CRG_BACKUP_DISABLE);
+		writel(CRG_HIWORD(USB_BACKUP_SELECT, USB_BACKUP_SELECT),
+		       usb->crg + CRG_BACKUP_SELECT);
+		writel(CRG_HIWORD(USB_BACKUP_DIVIDER, USB_BACKUP_DIVIDER),
+		       usb->crg + CRG_BACKUP_DIVIDER);
+		writel(CRG_HIWORD(USB_BACKUP_PLL, USB_BACKUP_PLL),
+		       usb->crg + CRG_BACKUP_SELECT);
+		writel(mux | USB_PHY_MUX_BACKUP, pctrl + PCTRL_PHY_MUX);
+		writel(USB_BACKUP_GATE, usb->crg + CRG_BACKUP_ENABLE);
+		return 0;
+	}
+
+	writel(USB_REFCLK_ISO, usb->crg + CRG_ISO_DISABLE);
+	ret = clk_prepare_enable(usb->tcxo);
+	if (ret)
+		return ret;
+	usleep_range(1000, 1500);
+	writel(mux & ~USB_PHY_MUX_BACKUP, pctrl + PCTRL_PHY_MUX);
+	return 0;
+}
+
 static void kirin710_dwc3_power_off(void *data)
 {
 	struct kirin710_dwc3 *usb = data;
@@ -60,7 +99,13 @@ static void kirin710_dwc3_power_off(void *data)
 	writel(USB_RST_CORE, usb->crg + CRG_RST_ENABLE);
 	writel(USB_RST_PHY, usb->crg + CRG_RST_ENABLE);
 	writel(USB_RST_PHY_POR, usb->crg + CRG_RST_ENABLE);
-	clk_disable_unprepare(usb->tcxo);
+	if (usb->backup_clock) {
+		writel(USB_BACKUP_GATE, usb->crg + CRG_BACKUP_DISABLE);
+		writel(CRG_HIWORD(0, USB_BACKUP_PLL | USB_BACKUP_SYS),
+		       usb->crg + CRG_BACKUP_SELECT);
+	} else {
+		clk_disable_unprepare(usb->tcxo);
+	}
 	writel(USB_RST_BUS, usb->crg + CRG_RST_ENABLE);
 	clk_bulk_disable_unprepare(ARRAY_SIZE(usb->clocks), usb->clocks);
 }
@@ -96,36 +141,35 @@ static int kirin710_dwc3_probe(struct platform_device *pdev)
 	if (IS_ERR(phy))
 		return PTR_ERR(phy);
 
-	if (readl(sysctrl + SYS_SLEEP_STATUS) & USB_BACKUP_CLOCK)
-		return dev_err_probe(dev, -EOPNOTSUPP, "USB backup reference clock selected\n");
+	usb->backup_clock = !!(readl(sysctrl + SYS_SLEEP_STATUS) & USB_BACKUP_CLOCK);
 
 	usb->clocks[0].id = "hclk_usb2otg";
 	usb->clocks[1].id = "clk_usb2phy_ref";
 	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(usb->clocks), usb->clocks);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to get USB clocks\n");
-	usb->tcxo = devm_clk_get(dev, "clk_usb2_tcxo_en");
-	if (IS_ERR(usb->tcxo))
-		return dev_err_probe(dev, PTR_ERR(usb->tcxo), "failed to get TCXO\n");
+	if (!usb->backup_clock) {
+		usb->tcxo = devm_clk_get(dev, "clk_usb2_tcxo_en");
+		if (IS_ERR(usb->tcxo))
+			return dev_err_probe(dev, PTR_ERR(usb->tcxo),
+					     "failed to get TCXO\n");
+	}
 
 	ret = clk_bulk_prepare_enable(ARRAY_SIZE(usb->clocks), usb->clocks);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to enable USB clocks\n");
 
 	writel(USB_RST_BUS, usb->crg + CRG_RST_DISABLE);
-	writel(USB_REFCLK_ISO, usb->crg + CRG_ISO_DISABLE);
-	ret = clk_prepare_enable(usb->tcxo);
+	ret = kirin710_dwc3_refclk_enable(usb, pctrl);
 	if (ret) {
 		writel(USB_RST_BUS, usb->crg + CRG_RST_ENABLE);
 		clk_bulk_disable_unprepare(ARRAY_SIZE(usb->clocks), usb->clocks);
-		return dev_err_probe(dev, ret, "failed to enable TCXO\n");
+		return dev_err_probe(dev, ret, "failed to enable PHY reference clock\n");
 	}
 	ret = devm_add_action_or_reset(dev, kirin710_dwc3_power_off, usb);
 	if (ret)
 		return ret;
 
-	usleep_range(1000, 1500);
-	writel(readl(pctrl + PCTRL_PHY_MUX) & ~USB_PHY_MUX_BACKUP, pctrl + PCTRL_PHY_MUX);
 
 	writel(USB_RST_PHY_POR, usb->crg + CRG_RST_DISABLE);
 	udelay(100);
