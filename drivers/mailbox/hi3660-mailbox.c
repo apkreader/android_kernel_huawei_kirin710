@@ -204,9 +204,20 @@ static int hi3660_mbox_send_data(struct mbox_chan *chan, void *msg)
 	return 0;
 }
 
+static bool hi3660_mbox_last_tx_done(struct mbox_chan *chan)
+{
+	unsigned long ch = (unsigned long)chan->con_priv;
+	struct hi3660_mbox *mbox = to_hi3660_mbox(chan->mbox);
+	void __iomem *base = MBOX_BASE(mbox, ch);
+
+	/* Leave ACK set for check_state() to clear before the next send. */
+	return readl(base + MBOX_MODE_REG) & MBOX_STATE_ACK;
+}
+
 static const struct mbox_chan_ops hi3660_mbox_ops = {
 	.startup	= hi3660_mbox_startup,
 	.send_data	= hi3660_mbox_send_data,
+	.last_tx_done	= hi3660_mbox_last_tx_done,
 };
 
 static struct mbox_chan *hi3660_mbox_xlate(struct mbox_controller *controller,
@@ -300,6 +311,8 @@ static int hi3660_mbox_probe(struct platform_device *pdev)
 		err = hi3660_mbox_parse_kirin710(mbox);
 		if (err)
 			return err;
+		mbox->controller.txdone_poll = true;
+		mbox->controller.txpoll_period = 1;
 	}
 
 	mbox->controller.dev = dev;
