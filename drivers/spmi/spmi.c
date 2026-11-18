@@ -492,6 +492,14 @@ static void of_spmi_register_devices(struct spmi_controller *ctrl)
 		dev_dbg(&ctrl->dev, "adding child %pOF\n", node);
 
 		err = of_property_read_u32_array(node, "reg", reg, 2);
+		if (err == -EINVAL &&
+		    of_machine_is_compatible("hisilicon,kirin710") &&
+		    of_device_is_compatible(ctrl->dev.of_node, "hisilicon,spmi-controller") &&
+		    of_device_is_compatible(node, "hisilicon-hisi-pmic-spmi") &&
+		    of_property_read_bool(node, "spmi-slave-container")) {
+			err = of_property_read_u32(node, "slave_id", &reg[0]);
+			reg[1] = SPMI_USID;
+		}
 		if (err) {
 			dev_err(&ctrl->dev,
 				"node %pOF err (%d) does not have 'reg' property\n",

@@ -288,8 +288,17 @@ static int spmi_controller_probe(struct platform_device *pdev)
 		return -EADDRNOTAVAIL;
 	}
 
+	if (of_device_is_compatible(pdev->dev.of_node, "hisilicon,spmi-controller") &&
+	    !of_machine_is_compatible("hisilicon,kirin710"))
+		return -ENODEV;
+
 	ret = of_property_read_u32(pdev->dev.of_node, "hisilicon,spmi-channel",
 				   &spmi_controller->channel);
+	if (ret == -EINVAL &&
+	    of_machine_is_compatible("hisilicon,kirin710") &&
+	    of_device_is_compatible(pdev->dev.of_node, "hisilicon,spmi-controller"))
+		ret = of_property_read_u32(pdev->dev.of_node, "spmi-channel",
+					   &spmi_controller->channel);
 	if (ret) {
 		dev_err(&pdev->dev, "can not get channel\n");
 		return -ENODEV;
@@ -319,6 +328,8 @@ static int spmi_controller_probe(struct platform_device *pdev)
 static const struct of_device_id spmi_controller_match_table[] = {
 	{
 		.compatible = "hisilicon,kirin970-spmi-controller",
+	}, {
+		.compatible = "hisilicon,spmi-controller",
 	},
 	{}
 };
