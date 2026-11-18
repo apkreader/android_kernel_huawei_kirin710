@@ -74,3 +74,10 @@ config STUB_CLK_HI3660
 	default COMMON_CLK_HI3660
 	help
 	  Build the Hisilicon Hi3660 stub clock driver.
+
+config COMMON_CLK_KIRIN710_USB
+	tristate "Kirin 710 USB bus clock"
+	depends on ARCH_HISI && OF && HWSPINLOCK_HISI && HI3660_MBOX
+	help
+	  Register the USB bus clock and coordinate its voltage vote with
+	  Kirin 710 firmware.
