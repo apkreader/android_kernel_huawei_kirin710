@@ -132,7 +132,8 @@ static void __init kirin710_gate_setup(struct device_node *np)
 
 	if (!strcmp(name, "clk_ufsio_ref"))
 		parent_compatible = "hisilicon,clk-sctrl";
-	else if (!strcmp(name, "clk_usb2otg_ref") || !strcmp(name, "clk_usb2otg"))
+	else if (!strcmp(name, "clk_usb2otg_ref") || !strcmp(name, "clk_usb2otg") ||
+		 !strcmp(name, "hclk_usb2otgfreq"))
 		parent_compatible = "hisilicon,clk-crgctrl";
 	else
 		return;
@@ -140,7 +141,8 @@ static void __init kirin710_gate_setup(struct device_node *np)
 	parent_name = of_clk_get_parent_name(np, 0);
 	if (!parent_name ||
 	    of_property_read_u32_array(np, "hisilicon,hi3xxx-clkgate", gate, 2) ||
-	    !gate[1] || (gate[1] & (gate[1] - 1)) || (gate[0] & 3))
+	    (gate[1] & (gate[1] - 1)) ||
+	    ((gate[1] == 0) != (strcmp(name, "hclk_usb2otgfreq") == 0)) || (gate[0] & 3))
 		return;
 
 	parent = of_get_parent(np);
@@ -153,6 +155,21 @@ static void __init kirin710_gate_setup(struct device_node *np)
 	if (ret || (u64)gate[0] + CLKGATE_SEPERATED_STATUS + sizeof(u32) >
 	    resource_size(&res))
 		return;
+
+	/* The firmware uses a zero mask for the bus clock's pass-through. */
+	if (!gate[1]) {
+		hw = clk_hw_register_fixed_factor(NULL, name, parent_name, 0, 1, 1);
+		if (IS_ERR(hw)) {
+			pr_err("%pOF: failed to register clock: %ld\n", np, PTR_ERR(hw));
+			return;
+		}
+		ret = of_clk_add_hw_provider(np, of_clk_hw_simple_get, hw);
+		if (ret) {
+			clk_hw_unregister_fixed_factor(hw);
+			pr_err("%pOF: failed to register clock provider: %d\n", np, ret);
+		}
+		return;
+	}
 
 	base = ioremap(res.start, resource_size(&res));
 	if (!base)
