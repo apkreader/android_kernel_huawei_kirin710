@@ -9,10 +9,13 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/mailbox_client.h>
 #include <linux/mailbox_controller.h>
+#include <linux/mailbox/kirin710.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 
@@ -344,6 +347,55 @@ static struct platform_driver hi3660_mbox_driver = {
 		.of_match_table = hi3660_mbox_of_match,
 	},
 };
+
+struct mbox_chan *kirin710_mbox_request_clk_channel(struct mbox_client *client)
+{
+	const unsigned int index = 13;
+	struct mbox_chan *chan = ERR_PTR(-EPROBE_DEFER);
+	struct platform_device *pdev;
+	struct device_node *np;
+	struct hi3660_mbox *mbox;
+	struct device *dev;
+	int ret;
+
+	np = of_find_compatible_node(NULL, NULL, "hisilicon,HiIPCV230");
+	if (!np)
+		return ERR_PTR(-ENODEV);
+
+	pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!pdev)
+		return chan;
+
+	dev = &pdev->dev;
+	device_lock(dev);
+	if (dev->driver != &hi3660_mbox_driver.driver)
+		goto out;
+
+	mbox = platform_get_drvdata(pdev);
+	if (!mbox)
+		goto out;
+
+	/* Unconfigured legacy channels have both interrupt bits set to zero. */
+	if (mbox->mchan[index].dst_irq == mbox->mchan[index].ack_irq) {
+		chan = ERR_PTR(-ENODEV);
+		goto out;
+	}
+
+	if (!device_link_add(client->dev, dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
+		chan = ERR_PTR(-ENOMEM);
+		goto out;
+	}
+
+	ret = mbox_bind_client(&mbox->chan[index], client);
+	chan = ret ? ERR_PTR(ret) : &mbox->chan[index];
+
+out:
+	device_unlock(dev);
+	put_device(dev);
+	return chan;
+}
+EXPORT_SYMBOL_GPL(kirin710_mbox_request_clk_channel);
 
 static int __init hi3660_mbox_init(void)
 {
