@@ -20,6 +20,7 @@
 #include <linux/compiler.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/mm.h>
 
 #include "internal.h"
@@ -621,10 +622,24 @@ static int ramoops_parse_dt_u32(struct platform_device *pdev,
 				const char *propname,
 				u32 default_value, u32 *value)
 {
-	u32 val32 = 0;
+	struct device_node *np = pdev->dev.of_node;
+	u64 size;
+	u32 val32;
 	int ret;
 
-	ret = of_property_read_u32(pdev->dev.of_node, propname, &val32);
+	/* Kirin 710 firmware encodes the ramoops sizes in two cells. */
+	if (of_machine_is_compatible("hisilicon,kirin710") &&
+	    of_property_count_u32_elems(np, propname) == 2) {
+		ret = of_property_read_u64(np, propname, &size);
+		if (ret)
+			return ret;
+		if (size > INT_MAX)
+			return -EOVERFLOW;
+		*value = size;
+		return 0;
+	}
+
+	ret = of_property_read_u32(np, propname, &val32);
 	if (ret == -EINVAL) {
 		/* field is missing, use default value. */
 		val32 = default_value;
@@ -656,14 +671,28 @@ static int ramoops_parse_dt(struct platform_device *pdev,
 	dev_dbg(&pdev->dev, "using Device Tree\n");
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!res) {
+	if (res) {
+		pdata->mem_size = resource_size(res);
+		pdata->mem_address = res->start;
+	} else if (of_machine_is_compatible("hisilicon,kirin710")) {
+		struct device_node *region;
+		struct reserved_mem *mem;
+
+		region = of_parse_phandle(of_node, "memory-region", 0);
+		if (!region)
+			return -EINVAL;
+		mem = of_reserved_mem_lookup(region);
+		of_node_put(region);
+		if (!mem || !mem->size)
+			return -EINVAL;
+
+		pdata->mem_size = mem->size;
+		pdata->mem_address = mem->base;
+	} else {
 		dev_err(&pdev->dev,
 			"failed to locate DT /reserved-memory resource\n");
 		return -EINVAL;
 	}
-
-	pdata->mem_size = resource_size(res);
-	pdata->mem_address = res->start;
 	/*
 	 * Setting "unbuffered" is deprecated and will be ignored if
 	 * "mem_type" is also specified.
