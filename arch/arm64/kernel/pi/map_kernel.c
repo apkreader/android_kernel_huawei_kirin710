@@ -197,22 +197,6 @@ static void __init remap_idmap_for_lpa2(void)
 	memset(init_pg_dir, 0, (u64)init_pg_end - (u64)init_pg_dir);
 }
 
-static void __init map_fdt(u64 fdt)
-{
-	static u8 ptes[INIT_IDMAP_FDT_SIZE] __initdata __aligned(PAGE_SIZE);
-	u64 efdt = fdt + MAX_FDT_SIZE;
-	u64 ptep = (u64)ptes;
-
-	/*
-	 * Map up to MAX_FDT_SIZE bytes, but avoid overlap with
-	 * the kernel image.
-	 */
-	map_range(&ptep, fdt, (u64)_text > fdt ? min((u64)_text, efdt) : efdt,
-		  fdt, PAGE_KERNEL, IDMAP_ROOT_LEVEL,
-		  (pte_t *)init_idmap_pg_dir, false, 0);
-	dsb(ishst);
-}
-
 asmlinkage void __init early_map_kernel(u64 boot_status, void *fdt)
 {
 	static char const chosen_str[] __initconst = "/chosen";
@@ -221,8 +205,6 @@ asmlinkage void __init early_map_kernel(u64 boot_status, void *fdt)
 	int root_level = 4 - CONFIG_PGTABLE_LEVELS;
 	int va_bits = VA_BITS;
 	int chosen;
-
-	map_fdt((u64)fdt);
 
 	/* Clear BSS and the initial page tables */
 	memset(__bss_start, 0, (u64)init_pg_end - (u64)__bss_start);
