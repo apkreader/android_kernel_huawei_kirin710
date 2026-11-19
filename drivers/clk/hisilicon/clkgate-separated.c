@@ -175,7 +175,8 @@ static void __init kirin710_gate_setup(struct device_node *np)
 	if (!strcmp(name, "clk_ufsio_ref"))
 		parent_compatible = "hisilicon,clk-sctrl";
 	else if (!strcmp(name, "clk_usb2otg_ref") || !strcmp(name, "clk_usb2otg") ||
-		 !strcmp(name, "hclk_usb2otgfreq"))
+		 !strcmp(name, "hclk_usb2otgfreq") || !strcmp(name, "pclk_wd0") ||
+		 !strcmp(name, "pclk_wd0_high"))
 		parent_compatible = "hisilicon,clk-crgctrl";
 	else
 		return;
@@ -184,7 +185,8 @@ static void __init kirin710_gate_setup(struct device_node *np)
 	if (!parent_name ||
 	    of_property_read_u32_array(np, "hisilicon,hi3xxx-clkgate", gate, 2) ||
 	    (gate[1] & (gate[1] - 1)) ||
-	    ((gate[1] == 0) != (strcmp(name, "hclk_usb2otgfreq") == 0)) || (gate[0] & 3))
+	    ((gate[1] == 0) != (!strcmp(name, "hclk_usb2otgfreq") ||
+			 !strcmp(name, "pclk_wd0"))) || (gate[0] & 3))
 		return;
 
 	parent = of_get_parent(np);
@@ -198,7 +200,7 @@ static void __init kirin710_gate_setup(struct device_node *np)
 	    resource_size(&res))
 		return;
 
-	/* The firmware uses a zero mask for the bus clock's pass-through. */
+	/* A zero gate mask denotes a clock with no hardware gate. */
 	if (!gate[1]) {
 		kirin710_register_passthrough(np, name, parent_name);
 		return;
@@ -228,6 +230,99 @@ static void __init kirin710_gate_setup(struct device_node *np)
 }
 CLK_OF_DECLARE(kirin710_gate, "hisilicon,hi3xxx-clk-gate",
 	       kirin710_gate_setup);
+
+static void __iomem *__init kirin710_crg_clock_reg(struct device_node *np,
+						   u32 offset)
+{
+	struct device_node *parent = of_get_parent(np);
+	struct resource res;
+	int ret;
+
+	if (!parent)
+		return NULL;
+	ret = of_device_is_compatible(parent, "hisilicon,clk-crgctrl") ?
+		of_address_to_resource(parent, 0, &res) : -EINVAL;
+	of_node_put(parent);
+	if (ret || (offset & 3) || (u64)offset + sizeof(u32) > resource_size(&res))
+		return NULL;
+
+	return ioremap(res.start + offset, sizeof(u32));
+}
+
+static void __init kirin710_watchdog_mux_setup(struct device_node *np)
+{
+	const char *name, *parents[2];
+	struct clk_hw *hw;
+	void __iomem *reg;
+	u32 mux[2];
+	int ret;
+
+	if (!of_machine_is_compatible("hisilicon,kirin710") ||
+	    of_property_read_string(np, "clock-output-names", &name) ||
+	    strcmp(name, "clk_wd0_mux") ||
+	    of_property_read_u32_array(np, "hisilicon,clkmux-reg", mux, 2) ||
+	    mux[1] != BIT(17))
+		return;
+
+	parents[0] = of_clk_get_parent_name(np, 0);
+	parents[1] = of_clk_get_parent_name(np, 1);
+	if (!parents[0] || !parents[1])
+		return;
+
+	reg = kirin710_crg_clock_reg(np, mux[0]);
+	if (!reg)
+		return;
+
+	hw = clk_hw_register_mux(NULL, name, parents, ARRAY_SIZE(parents), 0,
+				 reg, __ffs(mux[1]), 1, CLK_MUX_READ_ONLY, NULL);
+	if (!IS_ERR(hw)) {
+		ret = of_clk_add_hw_provider(np, of_clk_hw_simple_get, hw);
+		if (!ret)
+			return;
+		clk_hw_unregister_mux(hw);
+	}
+	iounmap(reg);
+}
+CLK_OF_DECLARE(kirin710_watchdog_mux, "hisilicon,hi3xxx-clk-mux",
+	       kirin710_watchdog_mux_setup);
+
+static void __init kirin710_cfgbus_div_setup(struct device_node *np)
+{
+	const char *name, *parent;
+	struct clk_hw *hw;
+	void __iomem *reg;
+	u32 div[2], range[2];
+	int ret;
+
+	if (!of_machine_is_compatible("hisilicon,kirin710") ||
+	    of_property_read_string(np, "clock-output-names", &name) ||
+	    strcmp(name, "sc_div_cfgbus") ||
+	    of_property_read_u32_array(np, "hisilicon,clkdiv", div, 2) ||
+	    of_property_read_u32_array(np, "hisilicon,clkdiv-table", range, 2) ||
+	    div[1] != GENMASK(1, 0) || range[0] != 4 || range[1] != 1 ||
+	    of_property_read_bool(np, "double_div"))
+		return;
+
+	parent = of_clk_get_parent_name(np, 0);
+	if (!parent)
+		return;
+
+	reg = kirin710_crg_clock_reg(np, div[0]);
+	if (!reg)
+		return;
+
+	hw = clk_hw_register_divider(NULL, name, parent, 0, reg, 0, 2,
+				     CLK_DIVIDER_READ_ONLY, NULL);
+	if (!IS_ERR(hw)) {
+		ret = of_clk_add_hw_provider(np, of_clk_hw_simple_get, hw);
+		if (!ret)
+			return;
+		clk_hw_unregister_divider(hw);
+	}
+	iounmap(reg);
+}
+CLK_OF_DECLARE(kirin710_cfgbus_div, "hisilicon,hi3xxx-clk-div",
+	       kirin710_cfgbus_div_setup);
 
 static void __init kirin710_hiword_gate_setup(struct device_node *np)
 {
