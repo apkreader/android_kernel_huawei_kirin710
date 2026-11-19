@@ -89,8 +89,8 @@ SYM_CODE_START(primary_entry)
 	mov	sp, x1
 	mov	x29, xzr
 	adrp	x0, init_idmap_pg_dir
-	mov	x1, xzr
-	bl	__pi_create_init_idmap
+	mov	x1, x21
+	bl	__pi_create_boot_idmap
 
 	/*
 	 * If the page tables have been populated with non-cacheable

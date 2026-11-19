@@ -6,6 +6,7 @@
  * Copyright (C) 2012 ARM Ltd.
  */
 
+#include <linux/libfdt.h>
 #include <linux/acpi.h>
 #include <linux/export.h>
 #include <linux/kernel.h>
@@ -169,11 +170,20 @@ static void __init smp_build_mpidr_hash(void)
 static void __init setup_machine_fdt(phys_addr_t dt_phys)
 {
 	int size;
-	void *dt_virt = fixmap_remap_fdt(dt_phys, &size, PAGE_KERNEL);
+	void *dt_virt = NULL;
 	const char *name;
 
-	if (dt_virt)
+	/* The position-independent boot code mapped and checked this DTB. */
+	if (dt_phys && IS_ALIGNED(dt_phys, 8)) {
+		dt_virt = (void *)(ALIGN((unsigned long)_end, 0x200000UL) +
+				   0x200000UL + (dt_phys & 0x1fffffUL));
+		if (fdt_check_header(dt_virt))
+			dt_virt = NULL;
+	}
+	if (dt_virt) {
+		size = fdt_totalsize(dt_virt);
 		memblock_reserve(dt_phys, size);
+	}
 
 	/*
 	 * dt_virt is a fixmap address, hence __pa(dt_virt) can't be used.
@@ -195,8 +205,6 @@ static void __init setup_machine_fdt(phys_addr_t dt_phys)
 			cpu_relax();
 	}
 
-	/* Early fixups are done, map the FDT as read-only now */
-	fixmap_remap_fdt(dt_phys, &size, PAGE_KERNEL_RO);
 
 	name = of_flat_dt_get_machine_name();
 	if (!name)
@@ -279,6 +287,27 @@ u64 cpu_logical_map(unsigned int cpu)
 	return __cpu_logical_map[cpu];
 }
 
+static void __init kirin710_restore_tcr(void)
+{
+	unsigned long ips = read_sysreg(id_aa64mmfr0_el1) & 0xf;
+	unsigned long tcr = read_sysreg(tcr_el1);
+	unsigned long updated;
+
+	/* Kirin 710 requires explicit non-LPA2 TCR_EL1 restore after removing idmap. */
+	ips = min(ips, 5UL);
+	updated = TCR_TxSZ(VA_BITS) | TCR_TG0_4K | TCR_TG1_4K |
+		  TCR_SHARED | TCR_IRGN_WBWA | TCR_ORGN_WBWA |
+		  TCR_A1 | TCR_ASID16 | TCR_TBI0 | (ips << TCR_IPS_SHIFT);
+	if (tcr != updated) {
+		dsb(sy);
+		write_sysreg(updated, tcr_el1);
+		isb();
+		__tlbi(vmalle1);
+		dsb(sy);
+		isb();
+	}
+}
+
 void __init __no_sanitize_address setup_arch(char **cmdline_p)
 {
 	setup_initial_init_mm(_text, _etext, _edata, _end);
@@ -319,6 +348,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 * point to zero page to avoid speculatively fetching new entries.
 	 */
 	cpu_uninstall_idmap();
+	kirin710_restore_tcr();
 
 	xen_early_init();
 	efi_init();

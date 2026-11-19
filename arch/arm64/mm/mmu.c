@@ -27,6 +27,7 @@
 #include <linux/kfence.h>
 #include <linux/pkeys.h>
 
+#include <asm/cacheflush.h>
 #include <asm/barrier.h>
 #include <asm/cputype.h>
 #include <asm/fixmap.h>
@@ -79,6 +80,7 @@ void noinstr set_swapper_pgd(pgd_t *pgdp, pgd_t pgd)
 	 */
 	if (rodata_is_rw) {
 		WRITE_ONCE(*pgdp, pgd);
+		dcache_clean_poc((unsigned long)pgdp, (unsigned long)(pgdp + 1));
 		dsb(ishst);
 		isb();
 		return;
@@ -158,9 +160,21 @@ bool pgattr_change_is_safe(u64 old, u64 new)
 	return ((old ^ new) & ~mask) == 0;
 }
 
+static void clean_fixmap_pgtable(enum fixed_addresses slot)
+{
+	unsigned long start = __fix_to_virt(slot);
+
+	dcache_clean_poc(start, start + PAGE_SIZE);
+}
+
 static void init_clear_pgtable(void *table)
 {
-	clear_page(table);
+	unsigned long *entry = table;
+	unsigned long *end = table + PAGE_SIZE;
+
+	/* The boot fixmap faults on DC ZVA through its temporary alias. */
+	while (entry < end)
+		WRITE_ONCE(*entry++, 0UL);
 
 	/* Ensure the zeroing is observed by page table walks. */
 	dsb(ishst);
@@ -238,6 +252,7 @@ static void alloc_init_cont_pte(pmd_t *pmdp, unsigned long addr,
 	 * ensure that all previous pgtable writes are visible to the table
 	 * walker.
 	 */
+	clean_fixmap_pgtable(FIX_PTE);
 	pte_clear_fixmap();
 }
 
@@ -320,6 +335,7 @@ static void alloc_init_cont_pmd(pud_t *pudp, unsigned long addr,
 		phys += next - addr;
 	} while (addr = next, addr != end);
 
+	clean_fixmap_pgtable(FIX_PMD);
 	pmd_clear_fixmap();
 }
 
@@ -378,6 +394,7 @@ static void alloc_init_pud(p4d_t *p4dp, unsigned long addr, unsigned long end,
 		phys += next - addr;
 	} while (pudp++, addr = next, addr != end);
 
+	clean_fixmap_pgtable(FIX_PUD);
 	pud_clear_fixmap();
 }
 
@@ -421,6 +438,8 @@ static void alloc_init_p4d(pgd_t *pgdp, unsigned long addr, unsigned long end,
 		phys += next - addr;
 	} while (p4dp++, addr = next, addr != end);
 
+	if (pgtable_l5_enabled())
+		clean_fixmap_pgtable(FIX_P4D);
 	p4d_clear_fixmap();
 }
 
@@ -770,12 +789,22 @@ core_initcall(map_entry_trampoline);
 static void __init declare_kernel_vmas(void)
 {
 	static struct vm_struct vmlinux_seg[KERNEL_SEGMENT_COUNT];
+	static struct vm_struct kirin_boot_aliases;
+	unsigned long alias_start = ALIGN((unsigned long)_end, SZ_2M);
+	unsigned long data_flags = alias_start == (unsigned long)_end ?
+				   VM_NO_GUARD : 0;
 
 	declare_vma(&vmlinux_seg[0], _text, _etext, VM_NO_GUARD);
 	declare_vma(&vmlinux_seg[1], __start_rodata, __inittext_begin, VM_NO_GUARD);
 	declare_vma(&vmlinux_seg[2], __inittext_begin, __inittext_end, VM_NO_GUARD);
 	declare_vma(&vmlinux_seg[3], __initdata_begin, __initdata_end, VM_NO_GUARD);
-	declare_vma(&vmlinux_seg[4], _data, _end, 0);
+	declare_vma(&vmlinux_seg[4], _data, _end, data_flags);
+
+	/* Reserve the boot DTB alias installed by the PI mapper. */
+	kirin_boot_aliases.addr = (void *)alias_start;
+	kirin_boot_aliases.size = 3 * SZ_2M;
+	kirin_boot_aliases.flags = VM_MAP | VM_NO_GUARD;
+	vm_area_add_early(&kirin_boot_aliases);
 }
 
 void __pi_map_range(u64 *pgd, u64 start, u64 end, u64 pa, pgprot_t prot,
@@ -807,6 +836,9 @@ static void __init create_idmap(void)
 			       IDMAP_ROOT_LEVEL, (pte_t *)idmap_pg_dir, false,
 			       __phys_to_virt(ptep) - ptep);
 	}
+	dcache_clean_poc((unsigned long)idmap_ptes, (unsigned long)idmap_ptes + sizeof(idmap_ptes));
+	dcache_clean_poc((unsigned long)kpti_ptes, (unsigned long)kpti_ptes + sizeof(kpti_ptes));
+	dcache_clean_poc((unsigned long)idmap_pg_dir, (unsigned long)idmap_pg_dir + PAGE_SIZE);
 }
 
 void __init paging_init(void)

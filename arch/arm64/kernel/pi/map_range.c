@@ -103,3 +103,18 @@ asmlinkage u64 __init create_init_idmap(pgd_t *pg_dir, pteval_t clrmask)
 
 	return ptep;
 }
+
+asmlinkage u64 __init create_boot_idmap(pgd_t *pg_dir, u64 fdt)
+{
+	u64 ptep = create_init_idmap(pg_dir, 0);
+	u64 end = fdt + MAX_FDT_SIZE;
+
+	/* Include the FDT tables in the cache maintenance done at entry. */
+	if ((u64)_text > fdt)
+		end = min(end, (u64)_text);
+	if (fdt && fdt < end)
+		map_range(&ptep, fdt, end, fdt, PAGE_KERNEL,
+			  IDMAP_ROOT_LEVEL, (pte_t *)pg_dir, false, 0);
+
+	return ptep;
+}

@@ -9,6 +9,7 @@
 #include <linux/sizes.h>
 #include <linux/string.h>
 
+#include <asm/cacheflush.h>
 #include <asm/memory.h>
 #include <asm/pgalloc.h>
 #include <asm/pgtable.h>
@@ -36,7 +37,7 @@ static void __init unmap_segment(pgd_t *pg_dir, u64 va_offset, void *start,
 		    false, root_level);
 }
 
-static void __init map_kernel(u64 kaslr_offset, u64 va_offset, int root_level)
+static void __init map_kernel(u64 kaslr_offset, u64 va_offset, int root_level, u64 fdt)
 {
 	bool enable_scs = IS_ENABLED(CONFIG_UNWIND_PATCH_PAC_INTO_SCS);
 	bool twopass = IS_ENABLED(CONFIG_RELOCATABLE);
@@ -44,6 +45,7 @@ static void __init map_kernel(u64 kaslr_offset, u64 va_offset, int root_level)
 	pgprot_t text_prot = PAGE_KERNEL_ROX;
 	pgprot_t data_prot = PAGE_KERNEL;
 	pgprot_t prot;
+	u64 dtb_alias_va = ALIGN((u64)_end + va_offset, SZ_2M) & ~PAGE_OFFSET;
 
 	/*
 	 * External debuggers may need to write directly to the text mapping to
@@ -96,6 +98,14 @@ static void __init map_kernel(u64 kaslr_offset, u64 va_offset, int root_level)
 		    true, root_level);
 	dsb(ishst);
 
+	/* Keep a writable alias of the boot DTB across removal of TTBR0. */
+	if (fdt && !fdt_check_header((const void *)fdt) &&
+	    fdt_totalsize((const void *)fdt) <= MAX_FDT_SIZE)
+		map_range(&pgdp, dtb_alias_va + SZ_2M, dtb_alias_va + 3 * SZ_2M,
+			  ALIGN_DOWN(fdt, SZ_2M), PAGE_KERNEL, root_level,
+			  (pte_t *)init_pg_dir, false, 0);
+	dcache_clean_poc((u64)init_pg_dir, pgdp);
+	dsb(sy);
 	idmap_cpu_replace_ttbr1(init_pg_dir);
 
 	if (twopass) {
@@ -132,9 +142,14 @@ static void __init map_kernel(u64 kaslr_offset, u64 va_offset, int root_level)
 			    __inittext_end, text_prot, false, root_level);
 	}
 
+	/* Publish the leaf entries changed by the second mapping pass. */
+	dcache_clean_poc((u64)init_pg_dir, pgdp);
+
 	/* Copy the root page table to its final location */
 	memcpy((void *)swapper_pg_dir + va_offset, init_pg_dir, PAGE_SIZE);
 	dsb(ishst);
+	dcache_clean_poc((u64)swapper_pg_dir, (u64)swapper_pg_dir + PAGE_SIZE);
+	dsb(sy);
 	idmap_cpu_replace_ttbr1(swapper_pg_dir);
 }
 
@@ -197,22 +212,6 @@ static void __init remap_idmap_for_lpa2(void)
 	memset(init_pg_dir, 0, (u64)init_pg_end - (u64)init_pg_dir);
 }
 
-static void __init map_fdt(u64 fdt)
-{
-	static u8 ptes[INIT_IDMAP_FDT_SIZE] __initdata __aligned(PAGE_SIZE);
-	u64 efdt = fdt + MAX_FDT_SIZE;
-	u64 ptep = (u64)ptes;
-
-	/*
-	 * Map up to MAX_FDT_SIZE bytes, but avoid overlap with
-	 * the kernel image.
-	 */
-	map_range(&ptep, fdt, (u64)_text > fdt ? min((u64)_text, efdt) : efdt,
-		  fdt, PAGE_KERNEL, IDMAP_ROOT_LEVEL,
-		  (pte_t *)init_idmap_pg_dir, false, 0);
-	dsb(ishst);
-}
-
 asmlinkage void __init early_map_kernel(u64 boot_status, void *fdt)
 {
 	static char const chosen_str[] __initconst = "/chosen";
@@ -221,8 +220,6 @@ asmlinkage void __init early_map_kernel(u64 boot_status, void *fdt)
 	int root_level = 4 - CONFIG_PGTABLE_LEVELS;
 	int va_bits = VA_BITS;
 	int chosen;
-
-	map_fdt((u64)fdt);
 
 	/* Clear BSS and the initial page tables */
 	memset(__bss_start, 0, (u64)init_pg_end - (u64)__bss_start);
@@ -261,5 +258,5 @@ asmlinkage void __init early_map_kernel(u64 boot_status, void *fdt)
 		remap_idmap_for_lpa2();
 
 	va_base = KIMAGE_VADDR + kaslr_offset;
-	map_kernel(kaslr_offset, va_base - pa_base, root_level);
+	map_kernel(kaslr_offset, va_base - pa_base, root_level, (u64)fdt);
 }

@@ -11,6 +11,7 @@
 #include <linux/mm.h>
 #include <linux/sizes.h>
 
+#include <asm/cacheflush.h>
 #include <asm/fixmap.h>
 #include <asm/kernel-pgtable.h>
 #include <asm/pgalloc.h>
@@ -107,6 +108,12 @@ void __init early_fixmap_init(void)
 	p4d_t *p4dp = p4d_offset_kimg(pgdp, addr);
 
 	early_fixmap_init_pud(p4dp, addr, end);
+
+	/* Make the bootstrap fixmap hierarchy visible to the page-table walker. */
+	dcache_clean_poc((unsigned long)bm_pte, (unsigned long)bm_pte + sizeof(bm_pte));
+	dcache_clean_poc((unsigned long)bm_pmd, (unsigned long)bm_pmd + sizeof(bm_pmd));
+	dcache_clean_poc((unsigned long)bm_pud, (unsigned long)bm_pud + sizeof(bm_pud));
+	dcache_clean_poc((unsigned long)pgdp, (unsigned long)pgdp + sizeof(*pgdp));
 }
 
 /*
@@ -125,8 +132,10 @@ void __set_fixmap(enum fixed_addresses idx,
 
 	if (pgprot_val(flags)) {
 		__set_pte(ptep, pfn_pte(phys >> PAGE_SHIFT, flags));
+		dcache_clean_poc((unsigned long)ptep, (unsigned long)(ptep + 1));
 	} else {
 		__pte_clear(&init_mm, addr, ptep);
+		dcache_clean_poc((unsigned long)ptep, (unsigned long)(ptep + 1));
 		flush_tlb_kernel_range(addr, addr+PAGE_SIZE);
 	}
 }
@@ -155,6 +164,7 @@ void *__init fixmap_remap_fdt(phys_addr_t dt_phys, int *size, pgprot_t prot)
 
 	/* map the first chunk so we can read the size from the header */
 	create_mapping_noalloc(dt_phys_base, dt_virt_base, PAGE_SIZE, prot);
+	dcache_clean_poc((unsigned long)bm_pte, (unsigned long)bm_pte + sizeof(bm_pte));
 
 	if (fdt_magic(dt_virt) != FDT_MAGIC)
 		return NULL;
@@ -166,6 +176,7 @@ void *__init fixmap_remap_fdt(phys_addr_t dt_phys, int *size, pgprot_t prot)
 	if (offset + *size > PAGE_SIZE) {
 		create_mapping_noalloc(dt_phys_base, dt_virt_base,
 				       offset + *size, prot);
+		dcache_clean_poc((unsigned long)bm_pte, (unsigned long)bm_pte + sizeof(bm_pte));
 	}
 
 	return dt_virt;
