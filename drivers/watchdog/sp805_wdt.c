@@ -23,6 +23,7 @@
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/of.h>
 #include <linux/pm.h>
 #include <linux/property.h>
 #include <linux/reset.h>
@@ -235,6 +236,7 @@ sp805_wdt_probe(struct amba_device *adev, const struct amba_id *id)
 	struct sp805_wdt *wdt;
 	struct reset_control *rst;
 	u64 rate = 0;
+	u32 legacy_timeout = 0;
 	int ret = 0;
 
 	wdt = devm_kzalloc(&adev->dev, sizeof(*wdt), GFP_KERNEL);
@@ -288,7 +290,11 @@ sp805_wdt_probe(struct amba_device *adev, const struct amba_id *id)
 	 * Otherwise, use DEFAULT_TIMEOUT
 	 */
 	wdt->wdd.timeout = DEFAULT_TIMEOUT;
-	watchdog_init_timeout(&wdt->wdd, 0, &adev->dev);
+	/* Kirin 710 firmware predates the standard timeout-sec property. */
+	if (of_machine_is_compatible("hisilicon,kirin710") &&
+	    !device_property_present(&adev->dev, "timeout-sec"))
+		device_property_read_u32(&adev->dev, "default-timeout", &legacy_timeout);
+	watchdog_init_timeout(&wdt->wdd, legacy_timeout, &adev->dev);
 	wdt_setload(&wdt->wdd, wdt->wdd.timeout);
 
 	/*
