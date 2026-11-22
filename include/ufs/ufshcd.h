@@ -32,6 +32,18 @@
 
 #define UFSHCD "ufshcd"
 
+/**
+ * ufshcd_upiu_wlun_to_scsi_wlun - maps UPIU W-LUN id to SCSI W-LUN ID
+ * @upiu_wlun_id: UPIU W-LUN id
+ *
+ * Return: SCSI W-LUN id.
+ */
+static inline u16 ufshcd_upiu_wlun_to_scsi_wlun(u8 upiu_wlun_id)
+{
+	return (upiu_wlun_id & ~UFS_UPIU_WLUN_ID) | SCSI_W_LUN_BASE;
+}
+
+
 struct scsi_device;
 struct ufs_hba;
 
