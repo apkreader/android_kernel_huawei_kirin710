@@ -647,7 +647,7 @@ static int ufs_kirin710_init(struct ufs_hba *hba)
 	ufs_sys_ctrl_writel(host, 0x80700040, LIBRA_UFS_AXI_READ_QOS);
 
 	ufshcd_set_variant(hba, host);
-	hba->quirks |= UFSHCI_QUIRK_BROKEN_HCE | UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8;
+	hba->quirks |= UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8;
 	hba->rpm_lvl = UFS_PM_LVL_0;
 	hba->spm_lvl = UFS_PM_LVL_0;
 
@@ -711,10 +711,57 @@ static int ufs_kirin710_link_startup(struct ufs_hba *hba,
 	return ufshcd_dme_set(hba, UIC_ARG_MIB(0xd0ab), 0);
 }
 
+static int ufs_kirin710_pwr_change_notify(struct ufs_hba *hba,
+					 enum ufs_notify_change_status status,
+					 struct ufs_pa_layer_attr *maximum,
+					 struct ufs_pa_layer_attr *requested)
+{
+	static const struct {
+		u16 attr;
+		u16 value;
+	} timing[] = {
+		{ 0xd0a0, 0x13 }, /* VS_DebugSaveConfigTime */
+		{ 0x1552, 0x4f }, { 0x1554, 0x4f }, { 0x1556, 0x4f }, /* HS sync lengths */
+		{ PA_HIBERN8TIME, 10 }, { PA_TACTIVATE, 10 },
+		{ 0xd085, 1 }, /* MPHY configuration update */
+		{ 0x155c, 0 }, /* PA_TxSkip */
+		{ 0xd044, DL_FC1ProtectionTimeOutVal_Default },
+		{ 0xd045, DL_TC1ReplayTimeOutVal_Default },
+		{ 0xd046, DL_AFC1ReqTimeOutVal_Default },
+	};
+	struct ufs_host_params params;
+	unsigned int i;
+	int ret;
+
+	if (status == POST_CHANGE)
+		return 0;
+	if (status != PRE_CHANGE || !maximum || !requested)
+		return -EINVAL;
+
+	/* The stock Libra board uses G3, Rate B, FAST when supported. */
+	ufshcd_init_host_params(&params);
+	if (!of_property_read_bool(hba->dev->of_node, "ufs-kirin-use-HS-GEAR3") ||
+	    maximum->pwr_rx != FAST_MODE)
+		params.desired_working_mode = UFS_PWM_MODE;
+	ret = ufshcd_negotiate_pwr_params(&params, maximum, requested);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ARRAY_SIZE(timing); i++) {
+		ret = ufshcd_dme_set(hba, UIC_ARG_MIB(timing[i].attr), timing[i].value);
+		if (ret)
+			dev_warn(hba->dev, "could not set UniPro attribute %#x: %d\n",
+				 timing[i].attr, ret);
+	}
+
+	return 0;
+}
+
 static const struct ufs_hba_variant_ops ufs_hba_kirin710_vops = {
 	.name = "kirin710",
 	.init = ufs_kirin710_init,
 	.link_startup_notify = ufs_kirin710_link_startup,
+	.pwr_change_notify = ufs_kirin710_pwr_change_notify,
 };
 
 static const struct of_device_id ufs_hisi_of_match[] = {
