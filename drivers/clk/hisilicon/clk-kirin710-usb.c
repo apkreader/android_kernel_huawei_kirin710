@@ -2,6 +2,7 @@
 #include <linux/bitfield.h>
 #include <linux/clk-provider.h>
 #include <linux/clkdev.h>
+#include <linux/fwnode.h>
 #include <linux/hwspinlock.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -231,8 +232,18 @@ static int kirin710_dvfs_register(struct kirin710_dvfs *dvfs, const char *vote_n
 	}
 
 	ret = of_clk_add_hw_provider(clock, of_clk_hw_simple_get, &clk->hw);
-	if (!ret)
-		return devm_add_action_or_reset(dev, kirin710_dvfs_remove_provider, clock);
+	if (!ret) {
+		ret = devm_add_action_or_reset(dev, kirin710_dvfs_remove_provider, clock);
+		if (ret)
+			return ret;
+
+		/*
+		 * The DVFS device supplies clocks represented by a separate DT
+		 * node. Unblock consumers that waited for that node to probe.
+		 */
+		fw_devlink_purge_absent_suppliers(of_fwnode_handle(clock));
+		return 0;
+	}
 
 put_clock:
 	of_node_put(clock);
