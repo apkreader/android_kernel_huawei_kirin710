@@ -172,7 +172,7 @@ static void __init kirin710_gate_setup(struct device_node *np)
 	    of_property_read_string(np, "clock-output-names", &name))
 		return;
 
-	if (!strcmp(name, "clk_ufsio_ref"))
+	if (!strcmp(name, "clk_ufsio_ref") || !strcmp(name, "pclk_ao_gpio6"))
 		parent_compatible = "hisilicon,clk-sctrl";
 	else if (!strcmp(name, "clk_usb2otg_ref") || !strcmp(name, "clk_usb2otg") ||
 		 !strcmp(name, "hclk_usb2otgfreq") || !strcmp(name, "pclk_wd0") ||
