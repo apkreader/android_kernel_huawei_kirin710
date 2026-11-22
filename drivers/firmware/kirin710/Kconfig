@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config KIRIN710_TRUSTCORE
+	bool "Huawei Kirin 710 TrustCore client"
+	depends on ARM64 && ARCH_HISI && OF_RESERVED_MEM && CMA
+	depends on SCSI_UFS_HISI=y && COMMON_CLK_KIRIN710_USB=y
+	depends on DMABUF_HEAPS && DMABUF_HEAPS_SYSTEM=y && DMABUF_HEAPS_CMA=y
+	select CRYPTO_AES
+	select CRYPTO_CBC
+	help
+	  Enable the TrustCore client used by Huawei Kirin 710 Android
+	  vendor services. This includes UFS RPMB, protected memory and
+	  legacy ION allocation backed by DMA-BUF heaps.

@@ -36,3 +36,5 @@ obj-y				+= qcom/
 obj-y				+= smccc/
 obj-y				+= tegra/
 obj-y				+= xilinx/
+
+obj-$(CONFIG_KIRIN710_TRUSTCORE) += kirin710/
