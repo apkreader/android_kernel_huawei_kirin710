@@ -86,6 +86,7 @@
 #include <linux/crc32.h>
 #include <linux/ctype.h>
 #include <linux/math64.h>
+#include <linux/of.h>
 #include <linux/slab.h>
 #include "check.h"
 #include "efi.h"
@@ -691,6 +692,25 @@ static void utf16_le_to_7bit(const __le16 *in, unsigned int size, u8 *out)
 	}
 }
 
+/*
+ * Huawei's Kirin 710 kernel exposes the internal UFS GPT labels without
+ * their trailing _a. Android's un-slotted fstab uses those names.
+ */
+static bool kirin710_ufs_gpt_labels(struct gendisk *disk)
+{
+	const struct device *dev;
+
+	if (!of_machine_is_compatible("hisilicon,kirin710"))
+		return false;
+
+	for (dev = disk_to_dev(disk)->parent; dev; dev = dev->parent) {
+		if (of_device_is_compatible(dev->of_node, "hisilicon,kirin-ufs"))
+			return true;
+	}
+
+	return false;
+}
+
 /**
  * efi_partition - scan for GPT partitions
  * @state: disk parsed partitions
@@ -714,6 +734,7 @@ int efi_partition(struct parsed_partitions *state)
 {
 	gpt_header *gpt = NULL;
 	gpt_entry *ptes = NULL;
+	bool kirin710_ufs = kirin710_ufs_gpt_labels(state->disk);
 	u32 i;
 	unsigned ssz = queue_logical_block_size(state->disk->queue) / 512;
 
@@ -747,6 +768,16 @@ int efi_partition(struct parsed_partitions *state)
 		/* Naively convert UTF16-LE to 7 bits. */
 		label_max = min(ARRAY_SIZE(info->volname) - 1,
 				ARRAY_SIZE(ptes[i].partition_name));
+		if (kirin710_ufs) {
+			unsigned int len = 0;
+
+			while (len < label_max && ptes[i].partition_name[len])
+				len++;
+			if (len > 2 && len < label_max &&
+			    ptes[i].partition_name[len - 2] == cpu_to_le16('_') &&
+			    ptes[i].partition_name[len - 1] == cpu_to_le16('a'))
+				label_max = len - 2;
+		}
 		utf16_le_to_7bit(ptes[i].partition_name, label_max, info->volname);
 		state->parts[i + 1].has_info = true;
 	}
