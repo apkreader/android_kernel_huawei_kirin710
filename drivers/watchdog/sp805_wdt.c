@@ -302,7 +302,9 @@ sp805_wdt_probe(struct amba_device *adev, const struct amba_id *id)
 	 * bit to tell the wdt subsystem
 	 */
 	if (wdt_is_running(&wdt->wdd)) {
-		wdt_enable(&wdt->wdd);
+		ret = wdt_enable(&wdt->wdd);
+		if (ret)
+			return ret;
 		set_bit(WDOG_HW_RUNNING, &wdt->wdd.status);
 	}
 

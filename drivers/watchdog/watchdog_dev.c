@@ -40,6 +40,7 @@
 #include <linux/miscdevice.h>	/* For handling misc devices */
 #include <linux/module.h>	/* For module stuff/... */
 #include <linux/mutex.h>	/* For mutexes */
+#include <linux/of.h>
 #include <linux/slab.h>		/* For memory functions */
 #include <linux/types.h>	/* For standard types (like size_t) */
 #include <linux/watchdog.h>	/* For watchdog specific items */
@@ -113,6 +114,12 @@ static ktime_t watchdog_next_keepalive(struct watchdog_device *wdd)
 
 	hw_heartbeat_ms = min_not_zero(timeout_ms, wdd->max_hw_heartbeat_ms);
 	keepalive_interval = ms_to_ktime(hw_heartbeat_ms / 2);
+
+	/* Match the downstream SP805 cadence until userspace opens the device. */
+	if (!watchdog_active(wdd) && wdd->parent &&
+	    of_device_is_compatible(wdd->parent->of_node, "arm,sp805") &&
+	    of_machine_is_compatible("hisilicon,kirin710"))
+		keepalive_interval = min(keepalive_interval, ms_to_ktime(3000));
 
 	/*
 	 * To ensure that the watchdog times out wdd->timeout seconds
