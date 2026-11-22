@@ -12,6 +12,7 @@
 #include <linux/kernel.h>
 #include <linux/clk-provider.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/slab.h>
@@ -135,27 +136,149 @@ static void __init kirin710_register_passthrough(struct device_node *np,
 	}
 }
 
-static void __init kirin710_ppll0_setup(struct device_node *np)
+#define KIRIN710_PPLL2_EN		0x000
+#define KIRIN710_PPLL2_DIS		0x004
+#define KIRIN710_PPLL2_ENABLE_VOTES	0x008
+#define KIRIN710_PPLL2_GT_EN		0x460
+#define KIRIN710_PPLL2_GT_DIS		0x464
+#define KIRIN710_PPLL2_GATE_VOTES	0x468
+#define KIRIN710_PPLL2_CTRL0		0x040
+#define KIRIN710_PPLL2_ENABLE_CPU	BIT(3)
+#define KIRIN710_PPLL2_GATE_CPU		BIT(18)
+#define KIRIN710_PPLL2_LOCKED		BIT(26)
+
+struct kirin710_ppll2 {
+	struct clk_hw hw;
+	void __iomem *crg;
+	void __iomem *pmctrl;
+	bool owns_enable;
+	bool owns_gate;
+};
+
+static int kirin710_ppll2_prepare(struct clk_hw *hw)
+{
+	struct kirin710_ppll2 *pll = container_of(hw, struct kirin710_ppll2, hw);
+	u32 status;
+	int ret;
+
+	status = readl(pll->crg + KIRIN710_PPLL2_ENABLE_VOTES);
+	pll->owns_enable = !(status & KIRIN710_PPLL2_ENABLE_CPU);
+	if (pll->owns_enable)
+		writel(KIRIN710_PPLL2_ENABLE_CPU, pll->crg + KIRIN710_PPLL2_EN);
+
+	ret = readl_poll_timeout(pll->pmctrl + KIRIN710_PPLL2_CTRL0, status,
+				 status & KIRIN710_PPLL2_LOCKED, 2, 1000);
+	if (ret) {
+		if (pll->owns_enable)
+			writel(KIRIN710_PPLL2_ENABLE_CPU, pll->crg + KIRIN710_PPLL2_DIS);
+		return ret;
+	}
+
+	status = readl(pll->crg + KIRIN710_PPLL2_GATE_VOTES);
+	pll->owns_gate = !(status & KIRIN710_PPLL2_GATE_CPU);
+	if (pll->owns_gate)
+		writel(KIRIN710_PPLL2_GATE_CPU, pll->crg + KIRIN710_PPLL2_GT_EN);
+
+	return 0;
+}
+
+static void kirin710_ppll2_unprepare(struct clk_hw *hw)
+{
+	struct kirin710_ppll2 *pll = container_of(hw, struct kirin710_ppll2, hw);
+
+	if (pll->owns_gate)
+		writel(KIRIN710_PPLL2_GATE_CPU, pll->crg + KIRIN710_PPLL2_GT_DIS);
+	if (pll->owns_enable)
+		writel(KIRIN710_PPLL2_ENABLE_CPU, pll->crg + KIRIN710_PPLL2_DIS);
+}
+
+static const struct clk_ops kirin710_ppll2_ops = {
+	.prepare = kirin710_ppll2_prepare,
+	.unprepare = kirin710_ppll2_unprepare,
+};
+
+static void __init kirin710_ppll2_setup(struct device_node *np,
+				       const char *name, const char *parent)
+{
+	struct clk_init_data init = {
+		.name = name,
+		.ops = &kirin710_ppll2_ops,
+		.flags = CLK_IGNORE_UNUSED,
+		.parent_names = &parent,
+		.num_parents = 1,
+	};
+	struct device_node *crg, *pmctrl;
+	struct resource crg_res, pmctrl_res;
+	struct kirin710_ppll2 *pll;
+	int ret = -EINVAL;
+
+	pmctrl = of_get_parent(np);
+	crg = of_find_compatible_node(NULL, NULL, "hisilicon,clk-crgctrl");
+	if (crg && of_device_is_compatible(pmctrl, "hisilicon,clk-pmctrl") &&
+	    !of_address_to_resource(crg, 0, &crg_res) &&
+	    !of_address_to_resource(pmctrl, 0, &pmctrl_res) &&
+	    resource_size(&crg_res) >= KIRIN710_PPLL2_GATE_VOTES + sizeof(u32) &&
+	    resource_size(&pmctrl_res) >= KIRIN710_PPLL2_CTRL0 + sizeof(u32))
+		ret = 0;
+	of_node_put(crg);
+	of_node_put(pmctrl);
+	if (ret)
+		goto error;
+
+	pll = kzalloc(sizeof(*pll), GFP_KERNEL);
+	if (!pll) {
+		ret = -ENOMEM;
+		goto error;
+	}
+	pll->crg = ioremap(crg_res.start, resource_size(&crg_res));
+	pll->pmctrl = ioremap(pmctrl_res.start, resource_size(&pmctrl_res));
+	if (!pll->crg || !pll->pmctrl) {
+		ret = -ENOMEM;
+		goto free_pll;
+	}
+
+	pll->hw.init = &init;
+	ret = clk_hw_register(NULL, &pll->hw);
+	if (ret)
+		goto free_pll;
+
+	ret = of_clk_add_hw_provider(np, of_clk_hw_simple_get, &pll->hw);
+	if (!ret)
+		return;
+	clk_hw_unregister(&pll->hw);
+free_pll:
+	if (pll->pmctrl)
+		iounmap(pll->pmctrl);
+	if (pll->crg)
+		iounmap(pll->crg);
+	kfree(pll);
+error:
+	pr_err("%pOF: failed to register PPLL2: %d\n", np, ret);
+}
+
+static void __init kirin710_ppll_setup(struct device_node *np)
 {
 	const char *name, *parent;
 	u32 enable[2], disable[2];
 
 	if (!of_machine_is_compatible("hisilicon,kirin710") ||
 	    of_property_read_string(np, "clock-output-names", &name) ||
-	    strcmp(name, "clk_ap_ppll0") ||
 	    of_property_read_u32_array(np, "hisilicon,ipc-lpm3-cmd-en", enable, 2) ||
-	    of_property_read_u32_array(np, "hisilicon,ipc-lpm3-cmd-dis", disable, 2) ||
-	    enable[1] || disable[1])
+	    of_property_read_u32_array(np, "hisilicon,ipc-lpm3-cmd-dis", disable, 2))
 		return;
 
 	parent = of_clk_get_parent_name(np, 0);
 	if (!parent)
 		return;
 
-	/* Firmware leaves PPLL0 running. Its enable and disable are no-ops. */
-	kirin710_register_passthrough(np, name, parent);
+	if (!strcmp(name, "clk_ap_ppll0") && !enable[1] && !disable[1]) {
+		/* Firmware leaves PPLL0 running. */
+		kirin710_register_passthrough(np, name, parent);
+	} else if (!strcmp(name, "clk_ap_ppll2") && enable[1] == 2 && disable[1] == 2) {
+		kirin710_ppll2_setup(np, name, parent);
+	}
 }
-CLK_OF_DECLARE(kirin710_ppll0, "hisilicon,ppll-ctrl", kirin710_ppll0_setup);
+CLK_OF_DECLARE(kirin710_ppll, "hisilicon,ppll-ctrl", kirin710_ppll_setup);
 
 static void __init kirin710_gate_setup(struct device_node *np)
 {
