@@ -249,20 +249,28 @@ static void __iomem *__init kirin710_crg_clock_reg(struct device_node *np,
 	return ioremap(res.start + offset, sizeof(u32));
 }
 
-static void __init kirin710_watchdog_mux_setup(struct device_node *np)
+static void __init kirin710_mux_setup(struct device_node *np)
 {
 	const char *name, *parents[2];
 	struct clk_hw *hw;
 	void __iomem *reg;
 	u32 mux[2];
+	u8 flags;
 	int ret;
 
 	if (!of_machine_is_compatible("hisilicon,kirin710") ||
 	    of_property_read_string(np, "clock-output-names", &name) ||
-	    strcmp(name, "clk_wd0_mux") ||
-	    of_property_read_u32_array(np, "hisilicon,clkmux-reg", mux, 2) ||
-	    mux[1] != BIT(17))
+	    of_property_read_u32_array(np, "hisilicon,clkmux-reg", mux, 2))
 		return;
+
+	if (!strcmp(name, "clk_wd0_mux") && mux[1] == BIT(17)) {
+		flags = CLK_MUX_READ_ONLY;
+	} else if (!strcmp(name, "clk_sec_pll_mux") && mux[1] == BIT(5) &&
+		   of_property_read_bool(np, "hiword")) {
+		flags = CLK_MUX_HIWORD_MASK;
+	} else {
+		return;
+	}
 
 	parents[0] = of_clk_get_parent_name(np, 0);
 	parents[1] = of_clk_get_parent_name(np, 1);
@@ -274,7 +282,7 @@ static void __init kirin710_watchdog_mux_setup(struct device_node *np)
 		return;
 
 	hw = clk_hw_register_mux(NULL, name, parents, ARRAY_SIZE(parents), 0,
-				 reg, __ffs(mux[1]), 1, CLK_MUX_READ_ONLY, NULL);
+				 reg, __ffs(mux[1]), 1, flags, NULL);
 	if (!IS_ERR(hw)) {
 		ret = of_clk_add_hw_provider(np, of_clk_hw_simple_get, hw);
 		if (!ret)
@@ -283,25 +291,32 @@ static void __init kirin710_watchdog_mux_setup(struct device_node *np)
 	}
 	iounmap(reg);
 }
-CLK_OF_DECLARE(kirin710_watchdog_mux, "hisilicon,hi3xxx-clk-mux",
-	       kirin710_watchdog_mux_setup);
+CLK_OF_DECLARE(kirin710_mux, "hisilicon,hi3xxx-clk-mux", kirin710_mux_setup);
 
-static void __init kirin710_cfgbus_div_setup(struct device_node *np)
+static void __init kirin710_div_setup(struct device_node *np)
 {
 	const char *name, *parent;
 	struct clk_hw *hw;
 	void __iomem *reg;
 	u32 div[2], range[2];
+	u8 flags;
 	int ret;
 
 	if (!of_machine_is_compatible("hisilicon,kirin710") ||
 	    of_property_read_string(np, "clock-output-names", &name) ||
-	    strcmp(name, "sc_div_cfgbus") ||
 	    of_property_read_u32_array(np, "hisilicon,clkdiv", div, 2) ||
 	    of_property_read_u32_array(np, "hisilicon,clkdiv-table", range, 2) ||
-	    div[1] != GENMASK(1, 0) || range[0] != 4 || range[1] != 1 ||
-	    of_property_read_bool(np, "double_div"))
+	    range[1] != 1 || of_property_read_bool(np, "double_div"))
 		return;
+
+	if (!strcmp(name, "sc_div_cfgbus") && div[1] == GENMASK(1, 0) && range[0] == 4) {
+		flags = CLK_DIVIDER_READ_ONLY;
+	} else if (!strcmp(name, "clk_sec_div") && div[1] == GENMASK(4, 0) &&
+		   range[0] == 32 && of_property_read_bool(np, "hiword")) {
+		flags = CLK_DIVIDER_HIWORD_MASK;
+	} else {
+		return;
+	}
 
 	parent = of_clk_get_parent_name(np, 0);
 	if (!parent)
@@ -311,8 +326,8 @@ static void __init kirin710_cfgbus_div_setup(struct device_node *np)
 	if (!reg)
 		return;
 
-	hw = clk_hw_register_divider(NULL, name, parent, 0, reg, 0, 2,
-				     CLK_DIVIDER_READ_ONLY, NULL);
+	hw = clk_hw_register_divider(NULL, name, parent, 0, reg, 0, hweight32(div[1]),
+				     flags, NULL);
 	if (!IS_ERR(hw)) {
 		ret = of_clk_add_hw_provider(np, of_clk_hw_simple_get, hw);
 		if (!ret)
@@ -321,8 +336,7 @@ static void __init kirin710_cfgbus_div_setup(struct device_node *np)
 	}
 	iounmap(reg);
 }
-CLK_OF_DECLARE(kirin710_cfgbus_div, "hisilicon,hi3xxx-clk-div",
-	       kirin710_cfgbus_div_setup);
+CLK_OF_DECLARE(kirin710_div, "hisilicon,hi3xxx-clk-div", kirin710_div_setup);
 
 static void __init kirin710_hiword_gate_setup(struct device_node *np)
 {
@@ -343,7 +357,7 @@ static void __init kirin710_hiword_gate_setup(struct device_node *np)
 
 	if (!strcmp(name, "clk_usb_tcxo_en"))
 		parent_compatible = "hisilicon,clk-pctrl";
-	else if (!strcmp(name, "autodiv_sysbus"))
+	else if (!strcmp(name, "autodiv_sysbus") || !strcmp(name, "clk_gt_sec"))
 		parent_compatible = "hisilicon,clk-crgctrl";
 	else
 		return;
