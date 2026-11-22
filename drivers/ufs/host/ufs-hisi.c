@@ -9,11 +9,17 @@
 #include <linux/time.h>
 #include <linux/delay.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_platform.h>
 #include <linux/dma-mapping.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
+#include <linux/unaligned.h>
+
+#include <scsi/scsi_device.h>
+#include <ufs/ufs-kirin710.h>
 
 #include <ufs/ufshcd.h>
 #include "ufshcd-pltfrm.h"
@@ -754,6 +760,173 @@ static struct platform_driver ufs_hisi_pltform = {
 		.of_match_table = ufs_hisi_of_match,
 	},
 };
+static DEFINE_MUTEX(kirin710_rpmb_lock);
+
+static struct scsi_device *ufs_kirin710_get_rpmb(void)
+{
+	struct scsi_device *sdev = ERR_PTR(-ENODEV);
+	struct platform_device *pdev;
+	struct device_node *node;
+	struct ufs_hba *hba;
+
+	if (!of_machine_is_compatible("hisilicon,kirin710"))
+		return sdev;
+
+	node = of_find_compatible_node(NULL, NULL, "hisilicon,kirin-ufs");
+	if (!node)
+		return sdev;
+
+	pdev = of_find_device_by_node(node);
+	of_node_put(node);
+	if (!pdev)
+		return sdev;
+
+	device_lock(&pdev->dev);
+	if (pdev->dev.driver == &ufs_hisi_pltform.driver) {
+		hba = platform_get_drvdata(pdev);
+		if (hba && hba->vops == &ufs_hba_kirin710_vops &&
+		    !hba->dev_info.b_advanced_rpmb_en) {
+			sdev = scsi_device_lookup(hba->host, 0, 0,
+						 ufshcd_upiu_wlun_to_scsi_wlun(UFS_UPIU_RPMB_WLUN));
+			if (!sdev)
+				sdev = ERR_PTR(-EAGAIN);
+		}
+	}
+	device_unlock(&pdev->dev);
+	put_device(&pdev->dev);
+
+	return sdev;
+}
+
+static int ufs_kirin710_rpmb_scsi(struct scsi_device *sdev, void *buf,
+				 unsigned int len, bool send)
+{
+	u8 cdb[12] = {
+		send ? SECURITY_PROTOCOL_OUT : SECURITY_PROTOCOL_IN,
+		0xec, /* UFS security protocol */
+		0, 1, /* Legacy RPMB, region 0 */
+	};
+	int resid = 0;
+	const struct scsi_exec_args args = { .resid = &resid };
+	int ret;
+
+	put_unaligned_be32(len, &cdb[6]);
+	/* The authenticated write may have reached the device on error. */
+	ret = scsi_execute_cmd(sdev, cdb, send ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
+			       buf, len, 30 * HZ, 0, &args);
+	if (ret < 0)
+		return ret;
+	return ret || resid ? -EIO : 0;
+}
+
+static int ufs_kirin710_rpmb_request_type(const u8 *req, unsigned int req_len,
+					 const u8 *result, unsigned int response_len)
+{
+	unsigned int i;
+	u16 opcode;
+
+	if (!req || !req_len || req_len % KIRIN710_RPMB_FRAME_SIZE ||
+	    !response_len || response_len % KIRIN710_RPMB_FRAME_SIZE ||
+	    req_len / KIRIN710_RPMB_FRAME_SIZE > U16_MAX ||
+	    response_len / KIRIN710_RPMB_FRAME_SIZE > U16_MAX)
+		return -EINVAL;
+
+	opcode = get_unaligned_be16(req + KIRIN710_RPMB_REQUEST);
+	switch (opcode) {
+	case KIRIN710_RPMB_COUNTER:
+		if (response_len != KIRIN710_RPMB_FRAME_SIZE)
+			return -EINVAL;
+		fallthrough;
+	case KIRIN710_RPMB_READ:
+		if (req_len != KIRIN710_RPMB_FRAME_SIZE || result)
+			return -EINVAL;
+		break;
+	case KIRIN710_RPMB_WRITE:
+		if (response_len != KIRIN710_RPMB_FRAME_SIZE || !result ||
+		    get_unaligned_be16(result + KIRIN710_RPMB_REQUEST) != KIRIN710_RPMB_READ_RESULT)
+			return -EINVAL;
+		for (i = KIRIN710_RPMB_FRAME_SIZE; i < req_len; i += KIRIN710_RPMB_FRAME_SIZE)
+			if (get_unaligned_be16(req + i + KIRIN710_RPMB_REQUEST) != opcode)
+				return -EINVAL;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	return opcode;
+}
+
+/**
+ * ufs_kirin710_rpmb_transfer() - Send an authenticated TrustCore transaction.
+ * @request: The request frames from the secure world.
+ * @request_len: Total length of the request frames in bytes.
+ * @result_request: Single result-read frame for writes, or NULL.
+ * @response: Buffer for the device response frames.
+ * @response_len: Total length of the response frames in bytes.
+ *
+ * TrustCore supplies and verifies the authentication data. Keep the SCSI
+ * commands serialized and hold a runtime PM reference across the transaction.
+ * The key provisioning operation is outside this interface.
+ *
+ * Return: 0 on success, negative errno on transport or input failure.
+ */
+int ufs_kirin710_rpmb_transfer(const void *request, unsigned int request_len,
+			       const void *result_request, void *response,
+			       unsigned int response_len)
+{
+	struct scsi_device *sdev;
+	u8 *buf;
+	int opcode, ret;
+
+	if (!response)
+		return -EINVAL;
+
+	opcode = ufs_kirin710_rpmb_request_type(request, request_len, result_request,
+						response_len);
+	if (opcode < 0)
+		return opcode;
+
+	sdev = ufs_kirin710_get_rpmb();
+	if (IS_ERR(sdev))
+		return PTR_ERR(sdev);
+
+	buf = kmalloc(max(request_len, response_len), GFP_KERNEL);
+	if (!buf) {
+		ret = -ENOMEM;
+		goto out_put;
+	}
+	memcpy(buf, request, request_len);
+	if (opcode == KIRIN710_RPMB_READ)
+		put_unaligned_be16(response_len / KIRIN710_RPMB_FRAME_SIZE,
+				   buf + KIRIN710_RPMB_BLOCK_COUNT);
+
+	mutex_lock(&kirin710_rpmb_lock);
+	ret = scsi_autopm_get_device(sdev);
+	if (ret)
+		goto out_unlock;
+
+	ret = ufs_kirin710_rpmb_scsi(sdev, buf, request_len, true);
+	if (!ret && result_request) {
+		memcpy(buf, result_request, KIRIN710_RPMB_FRAME_SIZE);
+		ret = ufs_kirin710_rpmb_scsi(sdev, buf, KIRIN710_RPMB_FRAME_SIZE, true);
+	}
+	if (!ret) {
+		memset(buf, 0, response_len);
+		ret = ufs_kirin710_rpmb_scsi(sdev, buf, response_len, false);
+		if (!ret)
+			memcpy(response, buf, response_len);
+	}
+
+	scsi_autopm_put_device(sdev);
+out_unlock:
+	mutex_unlock(&kirin710_rpmb_lock);
+	kfree_sensitive(buf);
+out_put:
+	scsi_device_put(sdev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ufs_kirin710_rpmb_transfer);
+
 module_platform_driver(ufs_hisi_pltform);
 
 MODULE_LICENSE("GPL");
