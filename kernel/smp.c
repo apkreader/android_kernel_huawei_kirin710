@@ -1029,6 +1029,8 @@ void __init smp_init(void)
 
 	pr_info("Bringing up secondary CPUs ...\n");
 
+	/* Defer secondary CPUs on Kirin 710 until ATF/TrustCore init runs. */
+	setup_max_cpus = 1;
 	bringup_nonboot_cpus(setup_max_cpus);
 
 	num_nodes = num_online_nodes();
