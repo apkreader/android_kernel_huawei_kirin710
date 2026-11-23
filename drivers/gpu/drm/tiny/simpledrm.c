@@ -1,6 +1,243 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/clk.h>
+#ifdef CONFIG_ARM64
+#include <asm/cacheflush.h>
+#include <asm/neon.h>
+#include <asm/simd.h>
+#include <linux/atomic.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
+#include <linux/mm.h>
+#include <linux/of.h>
+#include <linux/of_irq.h>
+#include <linux/vmalloc.h>
+
+#include <drm/drm_atomic.h>
+#include <drm/drm_atomic_helper.h>
+#include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_vblank.h>
+
+static bool marie_fb_is_wc;
+static void *marie_fb_buf[3];
+static u32 marie_fb_phys[3];
+static DEFINE_SPINLOCK(marie_dss_lock);
+static unsigned int marie_front_idx;
+static unsigned int marie_queued_idx;
+static void __iomem *marie_dss_base;
+static u32 marie_dss_dma_off;
+static u32 marie_dss_flush_off;
+static bool marie_dss_tribuf;
+static bool marie_dss_vsync_ready;
+static struct drm_crtc *marie_drm_crtc;
+
+static irqreturn_t marie_dss_vsync_isr(int irq, void *data)
+{
+	u32 s1 = readl(marie_dss_base + 0x12224); /* GLB_CPU_PDP_INTS */
+	u32 s2 = readl(marie_dss_base + 0x7d248); /* LDI_CPU_ITF_INTS */
+
+	if (s2)
+		writel(s2, marie_dss_base + 0x7d248);
+	if (s1)
+		writel(s1, marie_dss_base + 0x12224);
+
+	if (s2 & BIT(4)) { /* BIT_VSYNC */
+		unsigned long flags;
+		struct drm_crtc *crtc;
+
+		spin_lock_irqsave(&marie_dss_lock, flags);
+		marie_front_idx = marie_queued_idx;
+		spin_unlock_irqrestore(&marie_dss_lock, flags);
+
+		crtc = smp_load_acquire(&marie_drm_crtc);
+		if (crtc)
+			drm_crtc_handle_vblank(crtc);
+	}
+	return IRQ_HANDLED;
+}
+
+static void marie_dss_init(u32 fb_phys0, u32 fb_phys1, u32 fb_phys2)
+{
+	static const struct {
+		const char *name;
+		u32 dma_off;
+		u32 flush_off;
+	} rchs[] = {
+		{ "D0", 0x52000, 0x10100 },
+		{ "D1", 0x53000, 0x10104 },
+		{ "V1", 0x28000, 0x10110 },
+		{ "G1", 0x40000, 0x10114 },
+		{ "D2", 0x50000, 0x10118 },
+		{ "D3", 0x51000, 0x1011c },
+	};
+	struct device_node *np;
+	int i, irq, ret;
+	u32 msk;
+
+	if (!of_machine_is_compatible("hisilicon,kirin710"))
+		return;
+
+	marie_dss_base = ioremap(0xe8600000, 0xc0000);
+	if (!marie_dss_base)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(rchs); i++) {
+		u32 addr = readl(marie_dss_base + rchs[i].dma_off + 0x60);
+
+		/* Match any scanout address inside the bootloader logo-buffer */
+		if (addr >= 0x18c00000U && addr < 0x1bc00000U) {
+			marie_dss_dma_off = rchs[i].dma_off;
+			marie_dss_flush_off = rchs[i].flush_off;
+			pr_info("kirin710-dss: active RCH_%s scanout at 0x%08x\n",
+				rchs[i].name, addr);
+			break;
+		}
+	}
+
+	np = of_find_node_by_path("/framebuffer@E8600000");
+	if (np) {
+		irq = of_irq_get(np, 0);
+		of_node_put(np);
+		if (irq > 0) {
+			writel(0xffffffffU, marie_dss_base + 0x7d248);
+			writel(0xffffffffU, marie_dss_base + 0x12224);
+			ret = request_irq(irq, marie_dss_vsync_isr, IRQF_SHARED,
+					  "kirin710-dss-vsync", marie_dss_base);
+			if (!ret) {
+				msk = readl(marie_dss_base + 0x12228);
+				writel(msk & ~BIT(16), marie_dss_base + 0x12228);
+				msk = readl(marie_dss_base + 0x7d24c);
+				writel(msk & ~BIT(4), marie_dss_base + 0x7d24c);
+				marie_dss_vsync_ready = true;
+			}
+		}
+	}
+
+	if (marie_dss_dma_off && marie_fb_buf[1] && marie_fb_buf[2] && marie_dss_vsync_ready) {
+		marie_fb_phys[0] = fb_phys0;
+		marie_fb_phys[1] = fb_phys1;
+		marie_fb_phys[2] = fb_phys2;
+		marie_dss_tribuf = true;
+		pr_info("kirin710-dss: triple-buffering and hardware vblank enabled\n");
+	}
+}
+
+static int marie_simpledrm_enable_vblank(struct drm_crtc *crtc)
+{
+	return 0;
+}
+
+static void marie_simpledrm_disable_vblank(struct drm_crtc *crtc)
+{
+}
+
+static void marie_simpledrm_crtc_atomic_enable(struct drm_crtc *crtc,
+					       struct drm_atomic_state *state)
+{
+	if (crtc->dev->num_crtcs)
+		drm_crtc_vblank_on(crtc);
+}
+
+static void marie_simpledrm_crtc_atomic_disable(struct drm_crtc *crtc,
+						struct drm_atomic_state *state)
+{
+	if (crtc->dev->num_crtcs)
+		drm_crtc_vblank_off(crtc);
+}
+
+static void marie_simpledrm_crtc_atomic_flush(struct drm_crtc *crtc,
+					      struct drm_atomic_state *state)
+{
+	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	struct drm_pending_vblank_event *event = crtc_state->event;
+
+	if (!event)
+		return;
+
+	crtc_state->event = NULL;
+	spin_lock_irq(&crtc->dev->event_lock);
+	if (crtc->dev->num_crtcs && drm_crtc_vblank_get(crtc) == 0)
+		drm_crtc_arm_vblank_event(crtc, event);
+	else
+		drm_crtc_send_vblank_event(crtc, event);
+	spin_unlock_irq(&crtc->dev->event_lock);
+}
+
+static void marie_simpledrm_atomic_commit_tail(struct drm_atomic_state *old_state)
+{
+	struct drm_device *dev = old_state->dev;
+
+	drm_atomic_helper_commit_modeset_disables(dev, old_state);
+	drm_atomic_helper_commit_modeset_enables(dev, old_state);
+	drm_atomic_helper_commit_planes(dev, old_state, 0);
+	drm_atomic_helper_fake_vblank(old_state);
+	drm_atomic_helper_commit_hw_done(old_state);
+	drm_atomic_helper_wait_for_flip_done(dev, old_state);
+	drm_atomic_helper_cleanup_planes(dev, old_state);
+}
+
+static const struct drm_mode_config_helper_funcs marie_simpledrm_mode_config_helper_funcs = {
+	.atomic_commit_tail = marie_simpledrm_atomic_commit_tail,
+};
+
+static void marie_neon_copy_row(u8 *dst, const u8 *src, unsigned int pixels)
+{
+	unsigned int blocks = pixels >> 4;
+	unsigned int rem = pixels & 15;
+
+	if (blocks) {
+		asm volatile(
+			".arch_extension simd\n"
+			"1:\n"
+			"prfm pldl1strm, [%[src], #256]\n"
+			"ld1 {v0.16b, v1.16b, v2.16b, v3.16b}, [%[src]], #64\n"
+			"st1 {v0.16b, v1.16b, v2.16b, v3.16b}, [%[dst]], #64\n"
+			"subs %w[cnt], %w[cnt], #1\n"
+			"b.ne 1b\n"
+			: [src] "+r" (src), [dst] "+r" (dst), [cnt] "+r" (blocks)
+			:
+			: "v0", "v1", "v2", "v3", "cc", "memory"
+		);
+	}
+	if (rem)
+		memcpy(dst, src, rem * 4);
+}
+
+static void marie_neon_rb_swap_row(u8 *dst, const u8 *src, unsigned int pixels)
+{
+	static const u8 rb_mask[16] __aligned(16) = {
+		2, 1, 0, 3,  6, 5, 4, 7,  10, 9, 8, 11,  14, 13, 12, 15
+	};
+	unsigned int blocks = pixels >> 4;
+	unsigned int rem = pixels & 15;
+
+	if (blocks) {
+		asm volatile(
+			".arch_extension simd\n"
+			"ld1 {v4.16b}, [%[mask]]\n"
+			"1:\n"
+			"prfm pldl1strm, [%[src], #256]\n"
+			"ld1 {v0.16b, v1.16b, v2.16b, v3.16b}, [%[src]], #64\n"
+			"tbl v0.16b, {v0.16b}, v4.16b\n"
+			"tbl v1.16b, {v1.16b}, v4.16b\n"
+			"tbl v2.16b, {v2.16b}, v4.16b\n"
+			"tbl v3.16b, {v3.16b}, v4.16b\n"
+			"st1 {v0.16b, v1.16b, v2.16b, v3.16b}, [%[dst]], #64\n"
+			"subs %w[cnt], %w[cnt], #1\n"
+			"b.ne 1b\n"
+			: [src] "+r" (src), [dst] "+r" (dst), [cnt] "+r" (blocks)
+			: [mask] "r" (rb_mask)
+			: "v0", "v1", "v2", "v3", "v4", "cc", "memory"
+		);
+	}
+	while (rem--) {
+		u32 p = *(const u32 *)src;
+		src += 4;
+		*(u32 *)dst = (p & 0xff00ff00U) | ((p & 0x00ff0000U) >> 16) | ((p & 0x000000ffU) << 16);
+		dst += 4;
+	}
+}
+#endif
 #include <linux/of_clk.h>
 #include <linux/minmax.h>
 #include <linux/of_address.h>
@@ -647,8 +884,132 @@ static void simpledrm_primary_plane_helper_atomic_update(struct drm_plane *plane
 			continue;
 
 		iosys_map_incr(&dst, drm_fb_clip_offset(sdev->pitch, sdev->format, &dst_clip));
-		drm_fb_blit(&dst, &sdev->pitch, sdev->format->format, shadow_plane_state->data,
-			    fb, &damage, &shadow_plane_state->fmtcnv_state);
+#ifdef CONFIG_ARM64
+		{
+			unsigned int marie_flip_idx = 0;
+			bool marie_do_flip = false;
+#endif
+		if (sdev->format->format == DRM_FORMAT_XRGB8888 &&
+		    (fb->format->format == DRM_FORMAT_ABGR8888 ||
+		     fb->format->format == DRM_FORMAT_XBGR8888 ||
+		     fb->format->format == DRM_FORMAT_ARGB8888 ||
+		     fb->format->format == DRM_FORMAT_XRGB8888) &&
+		    !dst.is_iomem && !shadow_plane_state->data[0].is_iomem) {
+			bool is_bgr = (fb->format->format == DRM_FORMAT_ABGR8888 ||
+				       fb->format->format == DRM_FORMAT_XBGR8888);
+			unsigned int y, h = drm_rect_height(&damage);
+			unsigned int w = drm_rect_width(&damage);
+			const u8 *src_base = (const u8 *)shadow_plane_state->data[0].vaddr +
+					     fb->offsets[0] + damage.y1 * fb->pitches[0] + damage.x1 * 4;
+			bool do_flip = marie_dss_tribuf && (w == sdev->mode.hdisplay && h == sdev->mode.vdisplay);
+			unsigned int target_idx = 0;
+			u8 *dst_base;
+
+			if (marie_dss_tribuf) {
+				unsigned long dflags;
+				unsigned int f_idx, q_idx;
+
+				spin_lock_irqsave(&marie_dss_lock, dflags);
+				f_idx = marie_front_idx;
+				q_idx = marie_queued_idx;
+				spin_unlock_irqrestore(&marie_dss_lock, dflags);
+				if (do_flip) {
+					for (target_idx = 0; target_idx < 3; target_idx++) {
+						if (target_idx != f_idx && target_idx != q_idx)
+							break;
+					}
+					marie_flip_idx = target_idx;
+					marie_do_flip = true;
+					dst_base = (u8 *)marie_fb_buf[target_idx];
+				} else {
+					target_idx = q_idx;
+					dst_base = (u8 *)marie_fb_buf[target_idx] +
+						   drm_fb_clip_offset(sdev->pitch, sdev->format, &dst_clip);
+				}
+			} else {
+				dst_base = (u8 *)dst.vaddr;
+			}
+#ifdef CONFIG_ARM64
+			if (may_use_simd()) {
+				for (y = 0; y < h; ) {
+					unsigned int end = min(y + 128U, h);
+
+					kernel_neon_begin();
+					if (!is_bgr) {
+						for (; y < end; y++)
+							marie_neon_copy_row(dst_base + y * sdev->pitch,
+									    src_base + y * fb->pitches[0], w);
+					} else {
+						for (; y < end; y++)
+							marie_neon_rb_swap_row(dst_base + y * sdev->pitch,
+									       src_base + y * fb->pitches[0], w);
+					}
+					kernel_neon_end();
+				}
+			} else
+#endif
+			if (!is_bgr) {
+				for (y = 0; y < h; y++)
+					memcpy(dst_base + y * sdev->pitch, src_base + y * fb->pitches[0], w * 4);
+			} else {
+				for (y = 0; y < h; y++) {
+					const u64 *sp64 = (const u64 *)(src_base + y * fb->pitches[0]);
+					u64 *dp64 = (u64 *)(dst_base + y * sdev->pitch);
+					unsigned int pairs = w >> 1;
+
+					while (pairs--) {
+						u64 p = *sp64++;
+						*dp64++ = (p & 0xff00ff00ff00ff00ULL) |
+							  ((p & 0x00ff000000ff0000ULL) >> 16) |
+							  ((p & 0x000000ff000000ffULL) << 16);
+					}
+					if (w & 1) {
+						u32 p = *(const u32 *)sp64;
+						*(u32 *)dp64 = (p & 0xff00ff00U) |
+							       ((p & 0x00ff0000U) >> 16) |
+							       ((p & 0x000000ffU) << 16);
+					}
+				}
+			}
+		} else if (sdev->format->format == DRM_FORMAT_XRGB8888 &&
+			   (fb->format->format == DRM_FORMAT_ABGR8888 ||
+			    fb->format->format == DRM_FORMAT_XBGR8888)) {
+			drm_fb_xrgb8888_to_abgr8888(&dst, &sdev->pitch, shadow_plane_state->data,
+						    fb, &damage, &shadow_plane_state->fmtcnv_state);
+		} else if (sdev->format->format == DRM_FORMAT_XRGB8888 &&
+			   fb->format->format == DRM_FORMAT_ARGB8888) {
+			drm_fb_memcpy(&dst, &sdev->pitch, shadow_plane_state->data, fb, &damage);
+		} else {
+			drm_fb_blit(&dst, &sdev->pitch, sdev->format->format, shadow_plane_state->data,
+				    fb, &damage, &shadow_plane_state->fmtcnv_state);
+		}
+#ifdef CONFIG_ARM64
+		if (!sdev->screen_base.is_iomem) {
+			if (marie_fb_is_wc) {
+				dsb(st);
+				if (marie_do_flip) {
+					unsigned long dflags;
+
+					spin_lock_irqsave(&marie_dss_lock, dflags);
+					writel(1, marie_dss_base + 0x10804);
+					writel(marie_fb_phys[marie_flip_idx], marie_dss_base + marie_dss_dma_off + 0x60);
+					writel(1, marie_dss_base + marie_dss_flush_off);
+					writel(1, marie_dss_base + 0x10128);
+					dsb(st);
+					writel(0, marie_dss_base + 0x10804);
+					marie_queued_idx = marie_flip_idx;
+					spin_unlock_irqrestore(&marie_dss_lock, dflags);
+				}
+			} else {
+				unsigned long base = (unsigned long)sdev->screen_base.vaddr;
+				unsigned long start = base + (unsigned long)dst_clip.y1 * sdev->pitch;
+				unsigned long len = (unsigned long)drm_rect_height(&dst_clip) * sdev->pitch;
+
+				dcache_clean_poc(start, start + len);
+			}
+		}
+		}
+#endif
 	}
 
 	drm_dev_exit(idx);
@@ -668,6 +1029,16 @@ static void simpledrm_primary_plane_helper_atomic_disable(struct drm_plane *plan
 
 	/* Clear screen to black if disabled */
 	iosys_map_memset(&sdev->screen_base, 0, 0, sdev->pitch * sdev->mode.vdisplay);
+#ifdef CONFIG_ARM64
+	if (!sdev->screen_base.is_iomem) {
+		unsigned long start = (unsigned long)sdev->screen_base.vaddr;
+
+		if (marie_fb_is_wc)
+			dsb(st);
+		else
+			dcache_clean_poc(start, start + (unsigned long)sdev->pitch * sdev->mode.vdisplay);
+	}
+#endif
 
 	drm_dev_exit(idx);
 }
@@ -717,6 +1088,11 @@ static enum drm_mode_status simpledrm_crtc_helper_mode_valid(struct drm_crtc *cr
 static const struct drm_crtc_helper_funcs simpledrm_crtc_helper_funcs = {
 	.mode_valid = simpledrm_crtc_helper_mode_valid,
 	.atomic_check = drm_crtc_helper_atomic_check,
+#ifdef CONFIG_ARM64
+	.atomic_enable = marie_simpledrm_crtc_atomic_enable,
+	.atomic_disable = marie_simpledrm_crtc_atomic_disable,
+	.atomic_flush = marie_simpledrm_crtc_atomic_flush,
+#endif
 };
 
 static const struct drm_crtc_funcs simpledrm_crtc_funcs = {
@@ -726,6 +1102,10 @@ static const struct drm_crtc_funcs simpledrm_crtc_funcs = {
 	.page_flip = drm_atomic_helper_page_flip,
 	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+#ifdef CONFIG_ARM64
+	.enable_vblank = marie_simpledrm_enable_vblank,
+	.disable_vblank = marie_simpledrm_disable_vblank,
+#endif
 };
 
 static const struct drm_encoder_funcs simpledrm_encoder_funcs = {
@@ -879,6 +1259,12 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 	 * Memory management
 	 */
 
+	if (!mem) {
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		if (res && page_is_ram(PFN_DOWN(res->start)))
+			mem = res;
+	}
+
 	if (mem) {
 		void *screen_base;
 
@@ -890,7 +1276,53 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 
 		drm_dbg(dev, "using system memory framebuffer at %pr\n", mem);
 
+#ifdef CONFIG_ARM64
+		if (page_is_ram(PFN_DOWN(mem->start))) {
+			unsigned long npages = PAGE_ALIGN(resource_size(mem)) >> PAGE_SHIFT;
+			struct page **pages = kvcalloc(npages, sizeof(*pages), GFP_KERNEL);
+			unsigned long pfn = PFN_DOWN(mem->start);
+			unsigned long i;
+
+			screen_base = NULL;
+			if (pages) {
+				for (i = 0; i < npages; i++)
+					pages[i] = pfn_to_page(pfn + i);
+				dcache_clean_poc((unsigned long)phys_to_virt(mem->start),
+						 (unsigned long)phys_to_virt(mem->start) + (npages << PAGE_SHIFT));
+				screen_base = vmap(pages, npages, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
+				kvfree(pages);
+				if (screen_base) {
+					unsigned int bi;
+
+					marie_fb_is_wc = true;
+					marie_fb_buf[0] = screen_base;
+					for (bi = 1; bi < 3; bi++) {
+						phys_addr_t bphys = mem->start + (phys_addr_t)bi * 0x00a00000UL;
+						unsigned long bpfn = PFN_DOWN(bphys);
+						struct page **bpages = kvcalloc(npages, sizeof(*bpages), GFP_KERNEL);
+
+						if (bpages) {
+							for (i = 0; i < npages; i++)
+								bpages[i] = pfn_to_page(bpfn + i);
+							dcache_clean_poc((unsigned long)phys_to_virt(bphys),
+									 (unsigned long)phys_to_virt(bphys) + (npages << PAGE_SHIFT));
+							marie_fb_buf[bi] = vmap(bpages, npages, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
+							kvfree(bpages);
+						}
+					}
+					marie_dss_init((u32)mem->start,
+						       (u32)(mem->start + 0x00a00000UL),
+						       (u32)(mem->start + 0x01400000UL));
+				}
+			}
+			if (!screen_base)
+				screen_base = devm_memremap(dev->dev, mem->start, resource_size(mem), MEMREMAP_WB);
+		} else {
+			screen_base = devm_memremap(dev->dev, mem->start, resource_size(mem), MEMREMAP_WC);
+		}
+#else
 		screen_base = devm_memremap(dev->dev, mem->start, resource_size(mem), MEMREMAP_WC);
+#endif
 		if (IS_ERR(screen_base))
 			return screen_base;
 
@@ -951,6 +1383,11 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 
 	nformats = drm_fb_build_fourcc_list(dev, &format->format, 1,
 					    sdev->formats, ARRAY_SIZE(sdev->formats));
+	if (format->format == DRM_FORMAT_XRGB8888 && nformats + 3 <= ARRAY_SIZE(sdev->formats)) {
+		sdev->formats[nformats++] = DRM_FORMAT_ARGB8888;
+		sdev->formats[nformats++] = DRM_FORMAT_XBGR8888;
+		sdev->formats[nformats++] = DRM_FORMAT_ABGR8888;
+	}
 
 	primary_plane = &sdev->primary_plane;
 	ret = drm_universal_plane_init(dev, primary_plane, 0, &simpledrm_primary_plane_funcs,
@@ -996,7 +1433,17 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 	if (ret)
 		return ERR_PTR(ret);
 
+#ifdef CONFIG_ARM64
+	dev->mode_config.helper_private = &marie_simpledrm_mode_config_helper_funcs;
+#endif
 	drm_mode_config_reset(dev);
+#ifdef CONFIG_ARM64
+	if (marie_dss_vsync_ready) {
+		ret = drm_vblank_init(dev, 1);
+		if (!ret)
+			smp_store_release(&marie_drm_crtc, crtc);
+	}
+#endif
 
 	return sdev;
 }
@@ -1014,7 +1461,7 @@ static struct drm_driver simpledrm_driver = {
 	.date			= DRIVER_DATE,
 	.major			= DRIVER_MAJOR,
 	.minor			= DRIVER_MINOR,
-	.driver_features	= DRIVER_ATOMIC | DRIVER_GEM | DRIVER_MODESET,
+	.driver_features	= DRIVER_ATOMIC | DRIVER_GEM | DRIVER_MODESET | DRIVER_RENDER,
 	.fops			= &simpledrm_fops,
 };
 
