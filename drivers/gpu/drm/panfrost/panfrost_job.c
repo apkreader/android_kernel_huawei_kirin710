@@ -848,7 +848,9 @@ int panfrost_job_init(struct panfrost_device *pfdev)
 	INIT_WORK(&pfdev->reset.work, panfrost_reset_work);
 	spin_lock_init(&js->job_lock);
 
-	js->irq = platform_get_irq_byname(to_platform_device(pfdev->dev), "job");
+	js->irq = platform_get_irq_byname_optional(to_platform_device(pfdev->dev), "job");
+	if (js->irq < 0)
+		js->irq = platform_get_irq_byname(to_platform_device(pfdev->dev), "JOB");
 	if (js->irq < 0)
 		return js->irq;
 
