@@ -197,6 +197,14 @@ put_node:
 	return ret;
 }
 
+static struct spmi_device *kirin710_pmic_sdev;
+
+struct spmi_device *kirin710_pmic_get_sdev(void)
+{
+	return kirin710_pmic_sdev;
+}
+EXPORT_SYMBOL_GPL(kirin710_pmic_get_sdev);
+
 static int kirin710_ufs_regulator_probe(struct spmi_device *sdev)
 {
 	struct device *dev = &sdev->dev;
@@ -273,6 +281,7 @@ static int kirin710_ufs_regulator_probe(struct spmi_device *sdev)
 	}
 	ret = PTR_ERR_OR_ZERO(devm_regulator_register(dev, desc, &config));
 	if (!ret && sdev->usid == 0) {
+		kirin710_pmic_sdev = sdev;
 		int clk_ret = kirin710_register_abb(sdev);
 
 		if (clk_ret)

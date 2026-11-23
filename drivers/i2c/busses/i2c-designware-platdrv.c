@@ -213,6 +213,11 @@ static int dw_i2c_plat_probe(struct platform_device *pdev)
 	struct dw_i2c_dev *dev;
 	int irq, ret;
 
+	if (of_device_is_compatible(device->of_node, "hisilicon,designware-i2c")) {
+		struct resource *r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		if (!r || r->start != 0xfdf0c000)
+			return -ENODEV;
+	}
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;
@@ -341,6 +346,7 @@ static void dw_i2c_plat_remove(struct platform_device *pdev)
 
 static const struct of_device_id dw_i2c_of_match[] = {
 	{ .compatible = "snps,designware-i2c", },
+	{ .compatible = "hisilicon,designware-i2c", },
 	{ .compatible = "mscc,ocelot-i2c", .data = (void *)MODEL_MSCC_OCELOT },
 	{ .compatible = "baikal,bt1-sys-i2c", .data = (void *)MODEL_BAIKAL_BT1 },
 	{}
