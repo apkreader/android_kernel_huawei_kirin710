@@ -578,7 +578,7 @@ void bpf_prog_kallsyms_del_all(struct bpf_prog *fp)
 
 #ifdef CONFIG_BPF_JIT
 /* All BPF JIT sysctl knobs here. */
-int bpf_jit_enable   __read_mostly = IS_BUILTIN(CONFIG_BPF_JIT_DEFAULT_ON);
+int bpf_jit_enable   __read_mostly = 0; /* Kirin 710 HHEE: use eBPF interpreter */
 int bpf_jit_kallsyms __read_mostly = IS_BUILTIN(CONFIG_BPF_JIT_DEFAULT_ON);
 int bpf_jit_harden   __read_mostly;
 long bpf_jit_limit   __read_mostly;
@@ -2330,6 +2330,124 @@ void bpf_patch_call_args(struct bpf_insn *insn, u32 stack_depth)
 		__bpf_call_base_args;
 	insn->code = BPF_JMP | BPF_CALL_ARGS;
 }
+
+#define MARIE_BPF_CB_MAX 64
+struct marie_bpf_cb_slot {
+	const struct bpf_prog *owner;
+	const struct bpf_insn *insns;
+	u32 interp_idx;
+};
+static DEFINE_SPINLOCK(marie_bpf_cb_lock);
+static struct marie_bpf_cb_slot marie_bpf_cb_slots[MARIE_BPF_CB_MAX];
+
+static u64 marie_bpf_cb_0(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[0].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[0].insns); }
+static u64 marie_bpf_cb_1(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[1].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[1].insns); }
+static u64 marie_bpf_cb_2(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[2].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[2].insns); }
+static u64 marie_bpf_cb_3(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[3].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[3].insns); }
+static u64 marie_bpf_cb_4(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[4].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[4].insns); }
+static u64 marie_bpf_cb_5(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[5].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[5].insns); }
+static u64 marie_bpf_cb_6(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[6].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[6].insns); }
+static u64 marie_bpf_cb_7(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[7].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[7].insns); }
+static u64 marie_bpf_cb_8(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[8].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[8].insns); }
+static u64 marie_bpf_cb_9(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[9].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[9].insns); }
+static u64 marie_bpf_cb_10(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[10].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[10].insns); }
+static u64 marie_bpf_cb_11(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[11].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[11].insns); }
+static u64 marie_bpf_cb_12(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[12].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[12].insns); }
+static u64 marie_bpf_cb_13(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[13].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[13].insns); }
+static u64 marie_bpf_cb_14(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[14].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[14].insns); }
+static u64 marie_bpf_cb_15(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[15].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[15].insns); }
+static u64 marie_bpf_cb_16(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[16].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[16].insns); }
+static u64 marie_bpf_cb_17(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[17].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[17].insns); }
+static u64 marie_bpf_cb_18(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[18].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[18].insns); }
+static u64 marie_bpf_cb_19(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[19].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[19].insns); }
+static u64 marie_bpf_cb_20(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[20].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[20].insns); }
+static u64 marie_bpf_cb_21(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[21].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[21].insns); }
+static u64 marie_bpf_cb_22(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[22].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[22].insns); }
+static u64 marie_bpf_cb_23(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[23].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[23].insns); }
+static u64 marie_bpf_cb_24(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[24].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[24].insns); }
+static u64 marie_bpf_cb_25(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[25].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[25].insns); }
+static u64 marie_bpf_cb_26(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[26].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[26].insns); }
+static u64 marie_bpf_cb_27(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[27].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[27].insns); }
+static u64 marie_bpf_cb_28(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[28].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[28].insns); }
+static u64 marie_bpf_cb_29(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[29].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[29].insns); }
+static u64 marie_bpf_cb_30(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[30].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[30].insns); }
+static u64 marie_bpf_cb_31(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[31].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[31].insns); }
+static u64 marie_bpf_cb_32(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[32].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[32].insns); }
+static u64 marie_bpf_cb_33(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[33].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[33].insns); }
+static u64 marie_bpf_cb_34(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[34].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[34].insns); }
+static u64 marie_bpf_cb_35(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[35].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[35].insns); }
+static u64 marie_bpf_cb_36(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[36].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[36].insns); }
+static u64 marie_bpf_cb_37(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[37].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[37].insns); }
+static u64 marie_bpf_cb_38(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[38].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[38].insns); }
+static u64 marie_bpf_cb_39(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[39].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[39].insns); }
+static u64 marie_bpf_cb_40(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[40].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[40].insns); }
+static u64 marie_bpf_cb_41(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[41].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[41].insns); }
+static u64 marie_bpf_cb_42(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[42].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[42].insns); }
+static u64 marie_bpf_cb_43(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[43].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[43].insns); }
+static u64 marie_bpf_cb_44(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[44].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[44].insns); }
+static u64 marie_bpf_cb_45(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[45].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[45].insns); }
+static u64 marie_bpf_cb_46(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[46].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[46].insns); }
+static u64 marie_bpf_cb_47(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[47].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[47].insns); }
+static u64 marie_bpf_cb_48(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[48].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[48].insns); }
+static u64 marie_bpf_cb_49(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[49].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[49].insns); }
+static u64 marie_bpf_cb_50(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[50].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[50].insns); }
+static u64 marie_bpf_cb_51(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[51].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[51].insns); }
+static u64 marie_bpf_cb_52(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[52].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[52].insns); }
+static u64 marie_bpf_cb_53(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[53].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[53].insns); }
+static u64 marie_bpf_cb_54(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[54].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[54].insns); }
+static u64 marie_bpf_cb_55(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[55].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[55].insns); }
+static u64 marie_bpf_cb_56(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[56].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[56].insns); }
+static u64 marie_bpf_cb_57(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[57].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[57].insns); }
+static u64 marie_bpf_cb_58(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[58].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[58].insns); }
+static u64 marie_bpf_cb_59(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[59].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[59].insns); }
+static u64 marie_bpf_cb_60(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[60].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[60].insns); }
+static u64 marie_bpf_cb_61(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[61].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[61].insns); }
+static u64 marie_bpf_cb_62(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[62].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[62].insns); }
+static u64 marie_bpf_cb_63(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) { return interpreters_args[marie_bpf_cb_slots[63].interp_idx](r1, r2, r3, r4, r5, marie_bpf_cb_slots[63].insns); }
+
+static const bpf_callback_t marie_bpf_cb_table[MARIE_BPF_CB_MAX] = { marie_bpf_cb_0, marie_bpf_cb_1, marie_bpf_cb_2, marie_bpf_cb_3, marie_bpf_cb_4, marie_bpf_cb_5, marie_bpf_cb_6, marie_bpf_cb_7, marie_bpf_cb_8, marie_bpf_cb_9, marie_bpf_cb_10, marie_bpf_cb_11, marie_bpf_cb_12, marie_bpf_cb_13, marie_bpf_cb_14, marie_bpf_cb_15, marie_bpf_cb_16, marie_bpf_cb_17, marie_bpf_cb_18, marie_bpf_cb_19, marie_bpf_cb_20, marie_bpf_cb_21, marie_bpf_cb_22, marie_bpf_cb_23, marie_bpf_cb_24, marie_bpf_cb_25, marie_bpf_cb_26, marie_bpf_cb_27, marie_bpf_cb_28, marie_bpf_cb_29, marie_bpf_cb_30, marie_bpf_cb_31, marie_bpf_cb_32, marie_bpf_cb_33, marie_bpf_cb_34, marie_bpf_cb_35, marie_bpf_cb_36, marie_bpf_cb_37, marie_bpf_cb_38, marie_bpf_cb_39, marie_bpf_cb_40, marie_bpf_cb_41, marie_bpf_cb_42, marie_bpf_cb_43, marie_bpf_cb_44, marie_bpf_cb_45, marie_bpf_cb_46, marie_bpf_cb_47, marie_bpf_cb_48, marie_bpf_cb_49, marie_bpf_cb_50, marie_bpf_cb_51, marie_bpf_cb_52, marie_bpf_cb_53, marie_bpf_cb_54, marie_bpf_cb_55, marie_bpf_cb_56, marie_bpf_cb_57, marie_bpf_cb_58, marie_bpf_cb_59, marie_bpf_cb_60, marie_bpf_cb_61, marie_bpf_cb_62, marie_bpf_cb_63 };
+
+bpf_callback_t marie_bpf_alloc_cb(const struct bpf_prog *owner,
+				  const struct bpf_insn *insns, u32 stack_depth)
+{
+	unsigned long flags;
+	u32 idx;
+	int i;
+
+	stack_depth = max_t(u32, stack_depth, 1);
+	idx = (round_up(stack_depth, 32) / 32) - 1;
+	if (idx >= ARRAY_SIZE(interpreters_args))
+		return NULL;
+
+	spin_lock_irqsave(&marie_bpf_cb_lock, flags);
+	for (i = 0; i < MARIE_BPF_CB_MAX; i++) {
+		if (!marie_bpf_cb_slots[i].owner) {
+			marie_bpf_cb_slots[i].owner = owner;
+			marie_bpf_cb_slots[i].insns = insns;
+			marie_bpf_cb_slots[i].interp_idx = idx;
+			spin_unlock_irqrestore(&marie_bpf_cb_lock, flags);
+			return marie_bpf_cb_table[i];
+		}
+	}
+	spin_unlock_irqrestore(&marie_bpf_cb_lock, flags);
+	return NULL;
+}
+
+static void marie_bpf_free_cbs(const struct bpf_prog *owner)
+{
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&marie_bpf_cb_lock, flags);
+	for (i = 0; i < MARIE_BPF_CB_MAX; i++) {
+		if (marie_bpf_cb_slots[i].owner == owner) {
+			marie_bpf_cb_slots[i].owner = NULL;
+			marie_bpf_cb_slots[i].insns = NULL;
+			marie_bpf_cb_slots[i].interp_idx = 0;
+		}
+	}
+	spin_unlock_irqrestore(&marie_bpf_cb_lock, flags);
+}
 #endif
 #endif
 
@@ -2872,6 +2990,11 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 		aux->func[i]->aux->poke_tab = NULL;
 		bpf_jit_free(aux->func[i]);
 	}
+#ifndef CONFIG_BPF_JIT_ALWAYS_ON
+#ifdef CONFIG_BPF_SYSCALL
+	marie_bpf_free_cbs(aux->prog);
+#endif
+#endif
 	if (aux->real_func_cnt) {
 		kfree(aux->func);
 		bpf_prog_unlock_free(aux->prog);

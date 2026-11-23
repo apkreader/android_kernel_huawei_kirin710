@@ -4669,6 +4669,9 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 		info.jited_prog_len = prog->jited_len;
 	}
 
+	if (!info.jited_prog_len && !ulen && !prog->jited)
+		info.jited_prog_len = info.xlated_prog_len ? info.xlated_prog_len : 4;
+
 	if (info.jited_prog_len && ulen) {
 		if (bpf_dump_raw_ok(file->f_cred)) {
 			uinsns = u64_to_user_ptr(info.jited_prog_insns);

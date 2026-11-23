@@ -20570,11 +20570,27 @@ static int fixup_call_args(struct bpf_verifier_env *env)
 	}
 	for (i = 0; i < prog->len; i++, insn++) {
 		if (bpf_pseudo_func(insn)) {
-			/* When JIT fails the progs with callback calls
-			 * have to be rejected, since interpreter doesn't support them yet.
-			 */
-			verbose(env, "callbacks are not allowed in non-JITed programs\n");
-			return -EINVAL;
+			extern bpf_callback_t marie_bpf_alloc_cb(const struct bpf_prog *owner,
+								 const struct bpf_insn *insns,
+								 u32 stack_depth);
+			int sidx = find_subprog(env, i + insn->imm + 1);
+			bpf_callback_t cb;
+
+			if (sidx < 0)
+				return -EFAULT;
+			cb = marie_bpf_alloc_cb(prog,
+						&prog->insnsi[env->subprog_info[sidx].start],
+						env->subprog_info[sidx].stack_depth);
+			if (!cb) {
+				verbose(env, "interpreter callback pool exhausted\n");
+				return -ENOMEM;
+			}
+			insn[0].imm = (u32)(unsigned long)cb;
+			insn[1].imm = ((u64)(unsigned long)cb) >> 32;
+			insn[0].src_reg = 0;
+			i++;
+			insn++;
+			continue;
 		}
 
 		if (!bpf_pseudo_call(insn))
