@@ -11,6 +11,9 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/regulator/driver.h>
+#include <linux/regulator/machine.h>
+#include <linux/regulator/of_regulator.h>
 
 #define KIRIN710_VOLT_LOCK	19
 #define KIRIN710_LOW_TEMP	GENMASK(27, 26)
@@ -250,6 +253,231 @@ put_clock:
 	return ret;
 }
 
+
+static struct kirin710_dvfs *marie_saved_dvfs;
+
+struct kirin710_g3d_clk {
+	struct clk_hw hw;
+	struct kirin710_dvfs *dvfs;
+	u32 set_cmd[2];
+	unsigned long rate;
+};
+
+static unsigned long kirin710_g3d_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
+{
+	struct kirin710_g3d_clk *g = container_of(hw, struct kirin710_g3d_clk, hw);
+
+	return g->rate ? g->rate : 413000000UL;
+}
+
+static long kirin710_g3d_round_rate(struct clk_hw *hw, unsigned long rate, unsigned long *parent_rate)
+{
+	return clamp(rate, 413000000UL, 999000000UL);
+}
+
+static DEFINE_MUTEX(kirin710_xfreq_lock);
+
+static int kirin710_g3d_set_rate(struct clk_hw *hw, unsigned long rate, unsigned long parent_rate)
+{
+	struct kirin710_g3d_clk *g = container_of(hw, struct kirin710_g3d_clk, hw);
+	u32 msg[8] = { g->set_cmd[0], (u32)(rate / 1000000UL) };
+	int ret;
+
+	mutex_lock(&kirin710_xfreq_lock);
+	ret = mbox_send_message(g->dvfs->channel, msg);
+	mutex_unlock(&kirin710_xfreq_lock);
+	if (ret < 0)
+		return ret;
+	g->rate = rate;
+	return 0;
+}
+
+static const struct clk_ops kirin710_g3d_clk_ops = {
+	.recalc_rate = kirin710_g3d_recalc_rate,
+	.round_rate = kirin710_g3d_round_rate,
+	.set_rate = kirin710_g3d_set_rate,
+};
+
+struct kirin710_g3d_reg {
+	struct device *dev;
+	struct mbox_client client;
+	struct mbox_chan *chan;
+	u32 enable_cmd[2];
+	u32 disable_cmd[2];
+	bool enabled;
+	int cur_uv;
+};
+
+static int kirin710_g3d_reg_enable(struct regulator_dev *rdev)
+{
+	struct kirin710_g3d_reg *reg = rdev_get_drvdata(rdev);
+	u32 msg[8] = { reg->enable_cmd[0], reg->enable_cmd[1] };
+	int ret;
+
+	ret = mbox_send_message(reg->chan, msg);
+	if (ret < 0)
+		return ret;
+	msleep(10);
+	reg->enabled = true;
+	return 0;
+}
+
+static int kirin710_g3d_reg_disable(struct regulator_dev *rdev)
+{
+	struct kirin710_g3d_reg *reg = rdev_get_drvdata(rdev);
+	u32 msg[8] = { reg->disable_cmd[0], reg->disable_cmd[1] };
+	int ret;
+
+	ret = mbox_send_message(reg->chan, msg);
+	if (ret < 0)
+		return ret;
+	reg->enabled = false;
+	return 0;
+}
+
+static int kirin710_g3d_reg_is_enabled(struct regulator_dev *rdev)
+{
+	struct kirin710_g3d_reg *reg = rdev_get_drvdata(rdev);
+
+	return reg->enabled ? 1 : 0;
+}
+
+static int kirin710_g3d_reg_set_voltage(struct regulator_dev *rdev, int min_uV, int max_uV, unsigned int *sel)
+{
+	struct kirin710_g3d_reg *reg = rdev_get_drvdata(rdev);
+
+	reg->cur_uv = min_uV;
+	return 0;
+}
+
+static int kirin710_g3d_reg_get_voltage(struct regulator_dev *rdev)
+{
+	struct kirin710_g3d_reg *reg = rdev_get_drvdata(rdev);
+
+	return reg->cur_uv ? reg->cur_uv : 800000;
+}
+
+static const struct regulator_ops kirin710_g3d_reg_ops = {
+	.enable = kirin710_g3d_reg_enable,
+	.disable = kirin710_g3d_reg_disable,
+	.is_enabled = kirin710_g3d_reg_is_enabled,
+	.set_voltage = kirin710_g3d_reg_set_voltage,
+	.get_voltage = kirin710_g3d_reg_get_voltage,
+};
+
+void marie_register_gpu_power_deferred(void)
+{
+	struct kirin710_dvfs *dvfs = marie_saved_dvfs;
+	struct device *dev;
+	struct device_node *np;
+	int ret;
+
+	if (!dvfs)
+		return;
+	dev = dvfs->dev;
+
+	np = of_find_node_by_name(NULL, "clk_g3d");
+	if (np) {
+		struct kirin710_g3d_clk *g = devm_kzalloc(dev, sizeof(*g), GFP_KERNEL);
+		struct clk_init_data init = {
+			.name = "clk_g3d",
+			.ops = &kirin710_g3d_clk_ops,
+		};
+
+		if (g && !of_property_read_u32_array(np, "hisilicon,set-rate-ipc-cmd", g->set_cmd, 2)) {
+			g->dvfs = dvfs;
+			g->rate = 413000000UL;
+			g->hw.init = &init;
+			ret = devm_clk_hw_register(dev, &g->hw);
+			if (!ret)
+				ret = of_clk_add_hw_provider(np, of_clk_hw_simple_get, &g->hw);
+			if (!ret) {
+				devm_add_action_or_reset(dev, kirin710_dvfs_remove_provider, np);
+				fw_devlink_purge_absent_suppliers(of_fwnode_handle(np));
+				pr_info("MARIE_GPU: registered clk_g3d (cmd=0x%x)\n", g->set_cmd[0]);
+			} else {
+				of_node_put(np);
+			}
+		} else {
+			of_node_put(np);
+		}
+	}
+
+	for_each_compatible_node(np, NULL, "ip-regulator-lpm") {
+		const char *rname = NULL;
+		struct kirin710_g3d_reg *reg;
+		struct regulator_desc *desc;
+		struct regulator_config cfg = { .dev = dev };
+		struct regulator_dev *rdev;
+
+		if (of_property_read_string(np, "regulator-name", &rname) || strcmp(rname, "g3d"))
+			continue;
+
+		reg = devm_kzalloc(dev, sizeof(*reg), GFP_KERNEL);
+		desc = devm_kzalloc(dev, sizeof(*desc), GFP_KERNEL);
+		if (!reg || !desc) {
+			of_node_put(np);
+			break;
+		}
+		if (of_property_read_u32_array(np, "ip_to_lpm_enable_step", reg->enable_cmd, 2) ||
+		    of_property_read_u32_array(np, "ip_to_lpm_disable_step", reg->disable_cmd, 2)) {
+			of_node_put(np);
+			break;
+		}
+		reg->dev = dev;
+		reg->cur_uv = 800000;
+		reg->client.dev = dev;
+		reg->client.tx_block = true;
+		reg->client.tx_tout = 300;
+		reg->chan = kirin710_mbox_request_channel(&reg->client, 14);
+		if (IS_ERR(reg->chan)) {
+			of_node_put(np);
+			break;
+		}
+		devm_add_action_or_reset(dev, kirin710_dvfs_free_channel, reg->chan);
+
+		desc->name = "g3d";
+		desc->type = REGULATOR_VOLTAGE;
+		desc->owner = THIS_MODULE;
+		desc->ops = &kirin710_g3d_reg_ops;
+		desc->continuous_voltage_range = true;
+		desc->min_uV = 700000;
+
+		cfg.of_node = np;
+		cfg.driver_data = reg;
+		cfg.init_data = of_get_regulator_init_data(dev, np, desc);
+		if (cfg.init_data) {
+			((struct regulator_init_data *)cfg.init_data)->constraints.min_uV = 700000;
+			((struct regulator_init_data *)cfg.init_data)->constraints.max_uV = 1200000;
+			((struct regulator_init_data *)cfg.init_data)->constraints.valid_ops_mask |= REGULATOR_CHANGE_VOLTAGE;
+		}
+		rdev = devm_regulator_register(dev, desc, &cfg);
+		if (!IS_ERR(rdev)) {
+			fw_devlink_purge_absent_suppliers(of_fwnode_handle(np));
+			pr_info("MARIE_GPU: registered g3d regulator (en=0x%x dis=0x%x)\n",
+				reg->enable_cmd[0], reg->disable_cmd[0]);
+		}
+		of_node_put(np);
+		break;
+	}
+}
+
+EXPORT_SYMBOL_GPL(marie_register_gpu_power_deferred);
+
+int kirin710_xfreq_send_mhz(u32 cmd0, u32 mhz)
+{
+	u32 msg[8] = { cmd0, mhz };
+	int ret;
+
+	if (!marie_saved_dvfs || !marie_saved_dvfs->channel)
+		return -EPROBE_DEFER;
+	mutex_lock(&kirin710_xfreq_lock);
+	ret = mbox_send_message(marie_saved_dvfs->channel, msg);
+	mutex_unlock(&kirin710_xfreq_lock);
+	return ret < 0 ? ret : 0;
+}
+EXPORT_SYMBOL_GPL(kirin710_xfreq_send_mhz);
+
 static int kirin710_dvfs_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -307,6 +535,7 @@ static int kirin710_dvfs_probe(struct platform_device *pdev)
 	if (ret && ret != -ENOENT)
 		dev_warn(dev, "could not register the secure processor clock: %d\n", ret);
 
+	marie_saved_dvfs = dvfs;
 	return 0;
 }
 

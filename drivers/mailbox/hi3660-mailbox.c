@@ -348,9 +348,10 @@ static struct platform_driver hi3660_mbox_driver = {
 	},
 };
 
-struct mbox_chan *kirin710_mbox_request_clk_channel(struct mbox_client *client)
+struct mbox_chan *kirin710_mbox_request_channel(struct mbox_client *client, unsigned int index)
 {
-	const unsigned int index = 13;
+	if (index >= MBOX_CHAN_MAX)
+		return ERR_PTR(-EINVAL);
 	struct mbox_chan *chan = ERR_PTR(-EPROBE_DEFER);
 	struct platform_device *pdev;
 	struct device_node *np;
@@ -394,6 +395,12 @@ out:
 	device_unlock(dev);
 	put_device(dev);
 	return chan;
+}
+EXPORT_SYMBOL_GPL(kirin710_mbox_request_channel);
+
+struct mbox_chan *kirin710_mbox_request_clk_channel(struct mbox_client *client)
+{
+	return kirin710_mbox_request_channel(client, 13);
 }
 EXPORT_SYMBOL_GPL(kirin710_mbox_request_clk_channel);
 

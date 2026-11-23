@@ -417,6 +417,8 @@ static int panfrost_device_runtime_suspend(struct device *dev)
 {
 	struct panfrost_device *pfdev = dev_get_drvdata(dev);
 
+	if (of_device_is_compatible(dev->of_node, "arm,malit6xx"))
+		return -EBUSY;
 	if (!panfrost_job_is_idle(pfdev))
 		return -EBUSY;
 

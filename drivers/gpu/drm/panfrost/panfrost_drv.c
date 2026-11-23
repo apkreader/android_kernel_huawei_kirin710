@@ -625,6 +625,11 @@ static int panfrost_probe(struct platform_device *pdev)
 		return -ENODEV;
 
 	pfdev->coherent = device_get_dma_attr(&pdev->dev) == DEV_DMA_COHERENT;
+	if (of_device_is_compatible(pdev->dev.of_node, "arm,malit6xx")) {
+		/* Kirin 710 DT system-coherency = <0> -> COHERENCY_ACE_LITE */
+		pdev->dev.dma_coherent = true;
+		pfdev->coherent = true;
+	}
 
 	/* Allocate and initialize the DRM device. */
 	ddev = drm_dev_alloc(&panfrost_drm_driver, &pdev->dev);
@@ -731,6 +736,13 @@ ATTRIBUTE_GROUPS(panfrost);
  * and then initialize num_supplies with ARRAY_SIZE - 1.
  */
 static const char * const default_supplies[] = { "mali", NULL };
+static const char * const kirin710_supplies[] = { "gpu", NULL };
+static const struct panfrost_compatible kirin710_data = {
+	.num_supplies = ARRAY_SIZE(kirin710_supplies) - 1,
+	.supply_names = kirin710_supplies,
+	.num_pm_domains = 1,
+	.pm_domain_names = NULL,
+};
 static const struct panfrost_compatible default_data = {
 	.num_supplies = ARRAY_SIZE(default_supplies) - 1,
 	.supply_names = default_supplies,
@@ -805,6 +817,7 @@ static const struct of_device_id dt_match[] = {
 	  .data = &amlogic_data, },
 	{ .compatible = "amlogic,meson-g12a-mali",
 	  .data = &amlogic_data, },
+	{ .compatible = "arm,malit6xx", .data = &kirin710_data, },
 	{ .compatible = "arm,mali-t604", .data = &default_data, },
 	{ .compatible = "arm,mali-t624", .data = &default_data, },
 	{ .compatible = "arm,mali-t628", .data = &default_data, },
