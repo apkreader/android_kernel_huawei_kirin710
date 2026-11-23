@@ -11,7 +11,11 @@
 #include <linux/mm.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
+#include <linux/dma-mapping.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/vmalloc.h>
+#include <drm/drm_gem_dma_helper.h>
+#include <drm/drm_gem_shmem_helper.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -19,6 +23,8 @@
 #include <drm/drm_vblank.h>
 
 static bool marie_fb_is_wc;
+static bool marie_cma_ready;
+static u32 marie_dss_default_stride;
 static void *marie_fb_buf[3];
 static u32 marie_fb_phys[3];
 static DEFINE_SPINLOCK(marie_dss_lock);
@@ -88,6 +94,7 @@ static void marie_dss_init(u32 fb_phys0, u32 fb_phys1, u32 fb_phys2)
 		if (addr >= 0x18c00000U && addr < 0x1bc00000U) {
 			marie_dss_dma_off = rchs[i].dma_off;
 			marie_dss_flush_off = rchs[i].flush_off;
+			marie_dss_default_stride = readl(marie_dss_base + rchs[i].dma_off + 0x64);
 			pr_info("kirin710-dss: active RCH_%s scanout at 0x%08x\n",
 				rchs[i].name, addr);
 			break;
@@ -179,6 +186,17 @@ static void marie_simpledrm_atomic_commit_tail(struct drm_atomic_state *old_stat
 static const struct drm_mode_config_helper_funcs marie_simpledrm_mode_config_helper_funcs = {
 	.atomic_commit_tail = marie_simpledrm_atomic_commit_tail,
 };
+
+static int marie_simpledrm_dumb_create(struct drm_file *file_priv,
+				       struct drm_device *dev,
+				       struct drm_mode_create_dumb *args)
+{
+	if (marie_cma_ready && args->width >= 1080 && args->height >= 2312 && args->bpp == 32) {
+		if (!drm_gem_dma_dumb_create(file_priv, dev, args))
+			return 0;
+	}
+	return drm_gem_shmem_dumb_create(file_priv, dev, args);
+}
 
 static void marie_neon_copy_row(u8 *dst, const u8 *src, unsigned int pixels)
 {
@@ -889,6 +907,38 @@ static void simpledrm_primary_plane_helper_atomic_update(struct drm_plane *plane
 			unsigned int marie_flip_idx = 0;
 			bool marie_do_flip = false;
 #endif
+		/* Zero-copy CMA direct scanout on Kirin 710 DSS V320 */
+		if (marie_dss_tribuf && fb->obj[0] &&
+		    fb->obj[0]->funcs && fb->obj[0]->funcs->vm_ops == &drm_gem_dma_vm_ops &&
+		    fb->width == sdev->mode.hdisplay && fb->height == sdev->mode.vdisplay &&
+		    (fb->pitches[0] & 15) == 0 &&
+		    (fb->format->format == DRM_FORMAT_ABGR8888 ||
+		     fb->format->format == DRM_FORMAT_XBGR8888 ||
+		     fb->format->format == DRM_FORMAT_ARGB8888 ||
+		     fb->format->format == DRM_FORMAT_XRGB8888)) {
+			struct drm_gem_dma_object *dma_obj = to_drm_gem_dma_obj(fb->obj[0]);
+			u64 paddr = (u64)dma_obj->dma_addr + fb->offsets[0];
+
+			if (paddr && paddr < 0x100000000ULL) {
+				bool is_bgr = (fb->format->format == DRM_FORMAT_ABGR8888 ||
+					       fb->format->format == DRM_FORMAT_XBGR8888);
+				u32 dfc_fmt = is_bgr ? (13U << 1) : (6U << 1);
+				unsigned long dflags;
+
+				dsb(st);
+				spin_lock_irqsave(&marie_dss_lock, dflags);
+				writel(1, marie_dss_base + 0x10804);
+				writel((u32)paddr, marie_dss_base + marie_dss_dma_off + 0x60);
+				writel(fb->pitches[0] >> 4, marie_dss_base + marie_dss_dma_off + 0x64);
+				writel(dfc_fmt, marie_dss_base + marie_dss_dma_off + 0x10c);
+				writel(1, marie_dss_base + marie_dss_flush_off);
+				writel(1, marie_dss_base + 0x10128);
+				dsb(st);
+				writel(0, marie_dss_base + 0x10804);
+				spin_unlock_irqrestore(&marie_dss_lock, dflags);
+				goto marie_zc_done;
+			}
+		}
 		if (sdev->format->format == DRM_FORMAT_XRGB8888 &&
 		    (fb->format->format == DRM_FORMAT_ABGR8888 ||
 		     fb->format->format == DRM_FORMAT_XBGR8888 ||
@@ -993,6 +1043,9 @@ static void simpledrm_primary_plane_helper_atomic_update(struct drm_plane *plane
 					spin_lock_irqsave(&marie_dss_lock, dflags);
 					writel(1, marie_dss_base + 0x10804);
 					writel(marie_fb_phys[marie_flip_idx], marie_dss_base + marie_dss_dma_off + 0x60);
+					if (marie_dss_default_stride)
+						writel(marie_dss_default_stride, marie_dss_base + marie_dss_dma_off + 0x64);
+					writel(6U << 1, marie_dss_base + marie_dss_dma_off + 0x10c);
 					writel(1, marie_dss_base + marie_dss_flush_off);
 					writel(1, marie_dss_base + 0x10128);
 					dsb(st);
@@ -1008,6 +1061,8 @@ static void simpledrm_primary_plane_helper_atomic_update(struct drm_plane *plane
 				dcache_clean_poc(start, start + len);
 			}
 		}
+marie_zc_done:
+		(void)0;
 		}
 #endif
 	}
@@ -1033,10 +1088,26 @@ static void simpledrm_primary_plane_helper_atomic_disable(struct drm_plane *plan
 	if (!sdev->screen_base.is_iomem) {
 		unsigned long start = (unsigned long)sdev->screen_base.vaddr;
 
-		if (marie_fb_is_wc)
+		if (marie_fb_is_wc) {
 			dsb(st);
-		else
+			if (marie_dss_tribuf && marie_fb_phys[0]) {
+				unsigned long dflags;
+
+				spin_lock_irqsave(&marie_dss_lock, dflags);
+				writel(1, marie_dss_base + 0x10804);
+				writel(marie_fb_phys[0], marie_dss_base + marie_dss_dma_off + 0x60);
+				if (marie_dss_default_stride)
+					writel(marie_dss_default_stride, marie_dss_base + marie_dss_dma_off + 0x64);
+				writel(6U << 1, marie_dss_base + marie_dss_dma_off + 0x10c);
+				writel(1, marie_dss_base + marie_dss_flush_off);
+				writel(1, marie_dss_base + 0x10128);
+				dsb(st);
+				writel(0, marie_dss_base + 0x10804);
+				spin_unlock_irqrestore(&marie_dss_lock, dflags);
+			}
+		} else {
 			dcache_clean_poc(start, start + (unsigned long)sdev->pitch * sdev->mode.vdisplay);
+		}
 	}
 #endif
 
@@ -1438,6 +1509,22 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 #endif
 	drm_mode_config_reset(dev);
 #ifdef CONFIG_ARM64
+	{
+		struct device_node *cma_np = of_find_node_by_name(NULL, "fastboot-cma-mem");
+
+		if (cma_np) {
+			struct reserved_mem *rmem = of_reserved_mem_lookup(cma_np);
+
+			if (rmem && rmem->priv) {
+				dev->dev->cma_area = rmem->priv;
+				dma_coerce_mask_and_coherent(dev->dev, DMA_BIT_MASK(32));
+				marie_cma_ready = true;
+				pr_info("kirin710-dss: zero-copy CMA scanout bound (%llu MiB)\n",
+					(unsigned long long)rmem->size >> 20);
+			}
+			of_node_put(cma_np);
+		}
+	}
 	if (marie_dss_vsync_ready) {
 		ret = drm_vblank_init(dev, 1);
 		if (!ret)
@@ -1455,7 +1542,13 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 DEFINE_DRM_GEM_FOPS(simpledrm_fops);
 
 static struct drm_driver simpledrm_driver = {
+#ifdef CONFIG_ARM64
+	.gem_prime_import_sg_table = drm_gem_shmem_prime_import_sg_table,
+	.dumb_create = marie_simpledrm_dumb_create,
+	.dumb_map_offset = drm_gem_dumb_map_offset,
+#else
 	DRM_GEM_SHMEM_DRIVER_OPS,
+#endif
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.date			= DRIVER_DATE,
