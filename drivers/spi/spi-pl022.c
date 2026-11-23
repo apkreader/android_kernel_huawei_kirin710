@@ -1851,6 +1851,14 @@ pl022_platform_data_dt_get(struct device *dev)
 	return pd;
 }
 
+static struct spi_controller *marie_spi1_ctlr;
+
+struct spi_controller *marie_get_spi1_ctlr(void)
+{
+	return marie_spi1_ctlr;
+}
+EXPORT_SYMBOL_GPL(marie_get_spi1_ctlr);
+
 static int pl022_probe(struct amba_device *adev, const struct amba_id *id)
 {
 	struct device *dev = &adev->dev;
@@ -1943,7 +1951,10 @@ static int pl022_probe(struct amba_device *adev, const struct amba_id *id)
 	}
 
 	/* Get DMA channels, try autoconfiguration first */
-	status = pl022_dma_autoprobe(pl022);
+	if (adev->res.start == 0xfdf08000)
+		status = -ENODEV;
+	else
+		status = pl022_dma_autoprobe(pl022);
 	if (status == -EPROBE_DEFER) {
 		dev_dbg(dev, "deferring probe to get DMA channel\n");
 		goto err_no_irq;
@@ -1967,6 +1978,8 @@ static int pl022_probe(struct amba_device *adev, const struct amba_id *id)
 		goto err_spi_register;
 	}
 	dev_dbg(dev, "probe succeeded\n");
+	if (adev->res.start == 0xfdf08000)
+		marie_spi1_ctlr = host;
 
 	/* let runtime pm put suspend */
 	if (platform_info->autosuspend_delay > 0) {
@@ -1977,7 +1990,8 @@ static int pl022_probe(struct amba_device *adev, const struct amba_id *id)
 			platform_info->autosuspend_delay);
 		pm_runtime_use_autosuspend(dev);
 	}
-	pm_runtime_put(dev);
+	if (adev->res.start != 0xfdf08000)
+		pm_runtime_put(dev);
 
 	return 0;
 
