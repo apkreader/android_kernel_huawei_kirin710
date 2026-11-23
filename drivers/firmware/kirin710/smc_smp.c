@@ -1487,6 +1487,17 @@ static int smc_init_secondary_cpus(void)
 	return 0;
 }
 
+void marie_smc_init_secondary_cpus(void);
+void marie_smc_init_secondary_cpus(void)
+{
+	if (!cmd_phys)
+		return;
+	smc_init_secondary_cpus();
+	pr_info("kirin710-smc: secondary CPUs initialized (online=%*pbl)\n",
+		cpumask_pr_args(cpu_online_mask));
+}
+EXPORT_SYMBOL_GPL(marie_smc_init_secondary_cpus);
+
 static int get_session_root_key(void)
 {
 	int ret;

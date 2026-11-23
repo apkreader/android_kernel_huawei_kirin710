@@ -72,6 +72,7 @@ static struct device *secs_dev =  NULL;
 
 static void hisi_secs_timer_init(void)
 {
+	return;
 	int cpu;
 	unsigned int flag = SECS_ONLY_CPU0_ONLINE;
 
@@ -318,7 +319,7 @@ static const struct of_device_id secs_ctrl_of_match[] = {
 	{},
 };
 
-static int secs_power_ctrl_suspend(struct device *dev)
+static int __maybe_unused secs_power_ctrl_suspend(struct device *dev)
 {
 	pr_info("%s: suspend +\n", __func__);
 	mutex_lock(&secs_count_lock);
@@ -329,7 +330,7 @@ static int secs_power_ctrl_suspend(struct device *dev)
 	return 0;
 }
 
-static int secs_power_ctrl_resume(struct device *dev)
+static int __maybe_unused secs_power_ctrl_resume(struct device *dev)
 {
 	pr_info("%s: resume +\n", __func__);
 	mutex_lock(&secs_count_lock);

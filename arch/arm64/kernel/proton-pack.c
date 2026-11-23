@@ -81,7 +81,7 @@ ssize_t cpu_show_spectre_v1(struct device *dev, struct device_attribute *attr,
  */
 static enum mitigation_state spectre_v2_state;
 
-static bool __read_mostly __nospectre_v2;
+static bool __read_mostly __nospectre_v2 = true; /* Kirin 710 HHEE big.LITTLE */
 static int __init parse_spectre_v2_param(char *str)
 {
 	__nospectre_v2 = true;
@@ -202,6 +202,9 @@ static enum mitigation_state spectre_v2_get_cpu_fw_mitigation_state(void)
 bool has_spectre_v2(const struct arm64_cpu_capabilities *entry, int scope)
 {
 	WARN_ON(scope != SCOPE_LOCAL_CPU || preemptible());
+
+	if (spectre_v2_mitigations_off())
+		return false;
 
 	if (spectre_v2_get_cpu_hw_mitigation_state() == SPECTRE_UNAFFECTED)
 		return false;
@@ -421,7 +424,7 @@ early_param("ssbd", parse_spectre_v4_param);
  */
 static bool spectre_v4_mitigations_off(void)
 {
-	bool ret = cpu_mitigations_off() ||
+	bool ret = __nospectre_v2 || cpu_mitigations_off() ||
 		   __spectre_v4_policy == SPECTRE_V4_POLICY_MITIGATION_DISABLED;
 
 	if (ret)
@@ -513,6 +516,9 @@ bool has_spectre_v4(const struct arm64_cpu_capabilities *cap, int scope)
 	enum mitigation_state state;
 
 	WARN_ON(scope != SCOPE_LOCAL_CPU || preemptible());
+
+	if (__nospectre_v2)
+		return false;
 
 	state = spectre_v4_get_cpu_hw_mitigation_state();
 	if (state == SPECTRE_VULNERABLE)
@@ -645,6 +651,8 @@ void spectre_v4_enable_mitigation(const struct arm64_cpu_capabilities *__unused)
 	enum mitigation_state state;
 
 	WARN_ON(preemptible());
+	if (__nospectre_v2)
+		return;
 
 	state = spectre_v4_enable_hw_mitigation();
 	if (state == SPECTRE_VULNERABLE)
@@ -983,6 +991,9 @@ bool is_spectre_bhb_affected(const struct arm64_cpu_capabilities *entry,
 			     int scope)
 {
 	WARN_ON(scope != SCOPE_LOCAL_CPU || preemptible());
+
+	if (__nospectre_v2)
+		return false;
 
 	if (supports_csv2p3(scope))
 		return false;

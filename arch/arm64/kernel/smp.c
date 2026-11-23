@@ -133,6 +133,11 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
 	 */
 	secondary_data.task = idle;
 	update_cpu_boot_status(CPU_MMU_OFF);
+	dcache_clean_poc((unsigned long)&secondary_data,
+			 (unsigned long)&secondary_data + sizeof(secondary_data));
+	dcache_clean_poc((unsigned long)&__early_cpu_boot_status,
+			 (unsigned long)&__early_cpu_boot_status + sizeof(__early_cpu_boot_status));
+	dsb(sy);
 
 	/* Now bring the CPU into our world */
 	ret = boot_secondary(cpu, idle);
