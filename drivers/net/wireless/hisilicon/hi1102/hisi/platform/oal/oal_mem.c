@@ -244,12 +244,12 @@ OAL_STATIC  oal_mem_pool_cfg_stru g_ast_mem_pool_cfg_table[] =
 };
 
 OAL_STATIC oal_uint8 *g_pauc_mem_pool[OAL_MEM_POOL_ID_BUTT] = {0};
-OAL_STATIC oal_uint8 g_auc_mem_pool_event[TOTAL_WLAN_MEM_EVENT_SIZE];
-OAL_STATIC oal_uint8 g_auc_mem_pool_shared_data_pkt[TOTAL_WLAN_MEM_SHARED_DATA_PKT_SIZE];
-OAL_STATIC oal_uint8 g_auc_mem_pool_shared_mgmt_pkt[TOTAL_WLAN_MEM_SHARED_MGMT_PKT_SIZE];
-OAL_STATIC oal_uint8 g_auc_mem_pool_local[TOTAL_WLAN_MEM_LOCAL_SIZE];
-OAL_STATIC oal_uint8 g_auc_mem_pool_mib[TOTAL_WLAN_MEM_MIB_SIZE];
-OAL_STATIC oal_uint8 g_auc_mem_pool_shared_dscr[TOTAL_WLAN_MEM_SHARED_DSCR_SIZE];
+OAL_STATIC oal_uint8 g_auc_mem_pool_event[TOTAL_WLAN_MEM_EVENT_SIZE] __aligned(OAL_MEM_INFO_SIZE);
+OAL_STATIC oal_uint8 g_auc_mem_pool_shared_data_pkt[TOTAL_WLAN_MEM_SHARED_DATA_PKT_SIZE] __aligned(OAL_MEM_INFO_SIZE);
+OAL_STATIC oal_uint8 g_auc_mem_pool_shared_mgmt_pkt[TOTAL_WLAN_MEM_SHARED_MGMT_PKT_SIZE] __aligned(OAL_MEM_INFO_SIZE);
+OAL_STATIC oal_uint8 g_auc_mem_pool_local[TOTAL_WLAN_MEM_LOCAL_SIZE] __aligned(OAL_MEM_INFO_SIZE);
+OAL_STATIC oal_uint8 g_auc_mem_pool_mib[TOTAL_WLAN_MEM_MIB_SIZE] __aligned(OAL_MEM_INFO_SIZE);
+OAL_STATIC oal_uint8 g_auc_mem_pool_shared_dscr[TOTAL_WLAN_MEM_SHARED_DSCR_SIZE] __aligned(OAL_MEM_INFO_SIZE);
 
 
 /******************************************************************************
@@ -1115,7 +1115,7 @@ oal_uint32  oal_mem_init_pool(oal_void)
         /* 记录每个内存池oal_malloc分配的地址 */
         g_pauc_pool_base_addr[ul_pool_id] = puc_base_addr;
 
-        puc_base_addr = (oal_uint8 *)OAL_GET_4BYTE_ALIGN_VALUE((oal_uint)puc_base_addr);
+        puc_base_addr = (oal_uint8 *)ALIGN((oal_uint)puc_base_addr, OAL_MEM_INFO_SIZE);
 
         ul_ret = oal_mem_create_pool((oal_uint8)ul_pool_id, puc_base_addr);
         if (OAL_SUCC != ul_ret)

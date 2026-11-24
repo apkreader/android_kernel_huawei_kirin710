@@ -1747,7 +1747,8 @@ OAL_STATIC oal_int32  wal_cfg80211_connect(
     /* 设置加密参数 */
 
 #ifdef _PRE_WLAN_FEATURE_WAPI
-    if(WITP_WAPI_VERSION == pst_sme->crypto.wpa_versions)
+    if ((WITP_WAPI_VERSION == pst_sme->crypto.wpa_versions) &&
+        (NL80211_AUTHTYPE_SAE != pst_sme->auth_type))
     {
 
         OAM_WARNING_LOG0(0, OAM_SF_ANY, "wal_cfg80211_connect::crypt ver is wapi!");
@@ -4636,23 +4637,10 @@ OAL_STATIC oal_wireless_dev_stru * wal_cfg80211_add_virtual_intf(oal_wiphy_stru 
             OAM_ERROR_LOG1(0, OAM_SF_CFG, "{wal_cfg80211_add_virtual_intf::Unsupported interface type[%d]!}\r\n", en_type);
             return ERR_PTR(-EINVAL);
         case NL80211_IFTYPE_P2P_DEVICE:
-#if defined(_PRE_PRODUCT_ID_HI110X_HOST)
-            pst_net_dev       = pst_mac_device->st_p2p_info.pst_p2p_net_device;
-            pst_wdev          = pst_net_dev->ieee80211_ptr;
-#else
-            /* p2p0 在加载wifi 驱动后创建，不需要通过该接口创建，直接返回已创建的p2p0 wireless device 即可 */
-            uc_p2p0_vap_idx   = pst_mac_device->st_p2p_info.uc_p2p0_vap_idx;
-            pst_p2p0_hmac_vap = (hmac_vap_stru *)mac_res_get_hmac_vap(uc_p2p0_vap_idx);
-            if (OAL_UNLIKELY(OAL_PTR_NULL == pst_p2p0_hmac_vap))
-            {
-                OAM_ERROR_LOG1(0, OAM_SF_ANY, "{wal_cfg80211_add_virtual_intf::pst_p2p0_hmac_vap[id=%d] null!!}",
-                            uc_p2p0_vap_idx);
-                return ERR_PTR(-ENODEV);
-            }
-            pst_net_dev       = pst_p2p0_hmac_vap->pst_p2p0_net_device;
-            pst_wdev          = pst_net_dev->ieee80211_ptr;
-#endif
-            return pst_wdev;
+            /* Hi1102 pre-registers p2p0 as a netdev and does not implement start_p2p_device.
+             * Returning an already-registered wdev here causes cfg80211_register_wdev() to
+             * double-add it to rdev->wdev_list (infinite list loop under wiphy_lock). */
+            return ERR_PTR(-EOPNOTSUPP);
         case NL80211_IFTYPE_P2P_CLIENT:
             en_vap_mode = WLAN_VAP_MODE_BSS_STA;
             en_p2p_mode = WLAN_P2P_CL_MODE;
@@ -5572,7 +5560,6 @@ OAL_STATIC oal_int32 wal_cfg80211_mgmt_tx(oal_wiphy_stru                *pst_wip
     /* 1.1 入参检查 */
     if ((OAL_PTR_NULL == pst_wiphy)
         || (OAL_PTR_NULL == pst_wdev)
-        || (OAL_PTR_NULL == pst_chan)
         || (OAL_PTR_NULL == pull_cookie)
         || (OAL_PTR_NULL == puc_buf))
     {
@@ -5628,7 +5615,7 @@ OAL_STATIC oal_int32 wal_cfg80211_mgmt_tx(oal_wiphy_stru                *pst_wip
 
     /* 2.1 消息参数准备 */
     OAL_MEMZERO(&st_mgmt_tx, OAL_SIZEOF(st_mgmt_tx));
-    st_mgmt_tx.channel = oal_ieee80211_frequency_to_channel(pst_chan->center_freq);
+    st_mgmt_tx.channel = pst_chan ? oal_ieee80211_frequency_to_channel(pst_chan->center_freq) : pst_mac_vap->st_channel.uc_chan_number;
     ul_ret = wal_add_cookie_to_array(g_cookie_array, &g_uc_cookie_array_bitmap, pull_cookie, &uc_cookie_idx);
     if (OAL_SUCC != ul_ret)
     {
@@ -6548,6 +6535,7 @@ oal_uint32  wal_cfg80211_init(oal_void)
             pst_wiphy->flags &= ~WIPHY_FLAG_PS_ON_BY_DEFAULT;
 #ifdef _PRE_WLAN_FEATURE_SAE
             pst_wiphy->features |= NL80211_FEATURE_SAE;
+            wiphy_ext_feature_set(pst_wiphy, NL80211_EXT_FEATURE_MFP_OPTIONAL);
 #endif
 
 #endif /* (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,34)) */

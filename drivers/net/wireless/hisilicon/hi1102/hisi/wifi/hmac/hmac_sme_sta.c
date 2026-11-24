@@ -1050,6 +1050,47 @@ oal_void  hmac_handle_scan_rsp_sta(hmac_vap_stru *pst_hmac_vap, oal_uint8 *puc_m
 }
 
 
+#ifdef _PRE_WLAN_FEATURE_SAE
+struct hi1102_sae_ext_auth_ctx {
+    struct delayed_work work;
+    struct net_device *netdev;
+    hmac_vap_stru *hmac_vap;
+    struct cfg80211_external_auth_params params;
+    int retries;
+};
+
+static struct hi1102_sae_ext_auth_ctx g_hi1102_sae_ext_auth;
+static bool g_hi1102_sae_ext_auth_inited;
+
+static void hi1102_sae_ext_auth_work_fn(struct work_struct *w)
+{
+    struct hi1102_sae_ext_auth_ctx *ctx =
+        container_of(to_delayed_work(w), struct hi1102_sae_ext_auth_ctx, work);
+    int ret;
+
+    if (!ctx->netdev || !ctx->netdev->ieee80211_ptr)
+        return;
+
+    if (!ctx->netdev->ieee80211_ptr->conn_owner_nlportid) {
+        if (ctx->retries < 20) {
+            ctx->retries++;
+            schedule_delayed_work(&ctx->work, msecs_to_jiffies(10));
+            return;
+        }
+        OAL_IO_PRINT("HI1102_SAE: conn_owner_nlportid still 0 after retries\n");
+        if (ctx->hmac_vap)
+            hmac_send_connect_result_to_dmac_sta(ctx->hmac_vap, OAL_FAIL);
+        return;
+    }
+
+    ret = cfg80211_external_auth_request(ctx->netdev, &ctx->params, GFP_KERNEL);
+    OAL_IO_PRINT("HI1102_SAE: cfg80211_external_auth_request ret=%d (portid=%u retries=%d)\n",
+                 ret, ctx->netdev->ieee80211_ptr->conn_owner_nlportid, ctx->retries);
+    if (ret != 0 && ctx->hmac_vap)
+        hmac_send_connect_result_to_dmac_sta(ctx->hmac_vap, OAL_FAIL);
+}
+#endif
+
 oal_void  hmac_handle_join_rsp_sta(hmac_vap_stru *pst_hmac_vap, oal_uint8 *puc_msg)
 {
     hmac_join_rsp_stru  *pst_join_rsp = (hmac_join_rsp_stru *)puc_msg;
@@ -1078,12 +1119,18 @@ oal_void  hmac_handle_join_rsp_sta(hmac_vap_stru *pst_hmac_vap, oal_uint8 *puc_m
 
             hmac_fsm_change_state(pst_hmac_vap, MAC_VAP_STATE_STA_WAIT_AUTH_SEQ2);
 
-            OAL_IO_PRINT("HI1102_SAE: requesting external auth (bssid=%pM)\n", ext_auth.bssid);
-            if (cfg80211_external_auth_request(pst_hmac_vap->pst_net_device, &ext_auth, GFP_KERNEL) != 0)
-            {
-                OAL_IO_PRINT("HI1102_SAE: cfg80211_external_auth_request failed\n");
-                hmac_send_connect_result_to_dmac_sta(pst_hmac_vap, OAL_FAIL);
+            OAL_IO_PRINT("HI1102_SAE: scheduling external auth (bssid=%pM)\n", ext_auth.bssid);
+            if (!g_hi1102_sae_ext_auth_inited) {
+                INIT_DELAYED_WORK(&g_hi1102_sae_ext_auth.work, hi1102_sae_ext_auth_work_fn);
+                g_hi1102_sae_ext_auth_inited = true;
+            } else {
+                cancel_delayed_work(&g_hi1102_sae_ext_auth.work);
             }
+            g_hi1102_sae_ext_auth.netdev = pst_hmac_vap->pst_net_device;
+            g_hi1102_sae_ext_auth.hmac_vap = pst_hmac_vap;
+            g_hi1102_sae_ext_auth.params = ext_auth;
+            g_hi1102_sae_ext_auth.retries = 0;
+            schedule_delayed_work(&g_hi1102_sae_ext_auth.work, msecs_to_jiffies(10));
             return;
         }
 #endif
@@ -1156,6 +1203,16 @@ oal_void hmac_sae_external_auth_complete(mac_vap_stru *pst_mac_vap, oal_uint16 u
     FRW_TIMER_IMMEDIATE_DESTROY_TIMER(&pst_hmac_vap->st_mgmt_timer);
     oal_memset(&st_auth_rsp, 0, sizeof(st_auth_rsp));
     if (us_status == WLAN_STATUS_SUCCESS) {
+        hmac_user_stru *pst_user_ap = (hmac_user_stru *)mac_res_get_hmac_user((oal_uint16)pst_hmac_vap->st_vap_base_info.uc_assoc_vap_id);
+        if (OAL_PTR_NULL == pst_user_ap) {
+            oal_uint16 us_user_index = 0;
+            if (OAL_SUCC != hmac_user_add(&pst_hmac_vap->st_vap_base_info, pst_hmac_vap->st_vap_base_info.auc_bssid, &us_user_index)) {
+                OAL_IO_PRINT("HI1102_SAE: hmac_user_add failed\n");
+                st_auth_rsp.us_status_code = MAC_UNSPEC_FAIL;
+                hmac_send_rsp_to_sme_sta(pst_hmac_vap, HMAC_SME_AUTH_RSP, (oal_uint8 *)&st_auth_rsp);
+                return;
+            }
+        }
         hmac_fsm_change_state(pst_hmac_vap, MAC_VAP_STATE_STA_AUTH_COMP);
         st_auth_rsp.us_status_code = HMAC_MGMT_SUCCESS;
     } else {

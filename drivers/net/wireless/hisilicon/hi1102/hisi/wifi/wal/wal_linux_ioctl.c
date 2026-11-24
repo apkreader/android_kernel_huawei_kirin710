@@ -3945,7 +3945,7 @@ OAL_STATIC oal_int32  _wal_netdev_set_mac_addr(oal_net_device_stru *pst_net_dev,
         return -OAL_EINVAL;
     }
 
-    oal_set_mac_addr((oal_uint8 *)(pst_net_dev->dev_addr), (oal_uint8 *)(pst_mac_addr->sa_data));
+    eth_hw_addr_set(pst_net_dev, (oal_uint8 *)(pst_mac_addr->sa_data));
 
 #if defined(_PRE_PRODUCT_ID_HI110X_HOST)
     return OAL_SUCC;
@@ -7662,14 +7662,14 @@ OAL_STATIC oal_uint32  wal_hipriv_add_vap(oal_net_device_stru *pst_cfg_net_dev, 
 #ifdef _PRE_WLAN_FEATURE_P2P
     if (en_p2p_mode == WLAN_P2P_DEV_MODE)
     {
-        oal_set_mac_addr((oal_uint8 *)OAL_NETDEVICE_MAC_ADDR(pst_net_dev), pst_mac_vap->pst_mib_info->st_wlan_mib_sta_config.auc_p2p0_dot11StationID);
+        eth_hw_addr_set(pst_net_dev, pst_mac_vap->pst_mib_info->st_wlan_mib_sta_config.auc_p2p0_dot11StationID);
 
         pst_mac_device->st_p2p_info.uc_p2p0_vap_idx = pst_mac_vap->uc_vap_id;
     }
     else
 #endif
     {
-        oal_set_mac_addr((oal_uint8 *)OAL_NETDEVICE_MAC_ADDR(pst_net_dev), pst_mac_vap->pst_mib_info->st_wlan_mib_sta_config.auc_dot11StationID);
+        eth_hw_addr_set(pst_net_dev, pst_mac_vap->pst_mib_info->st_wlan_mib_sta_config.auc_dot11StationID);
     }
 
 
@@ -12840,7 +12840,7 @@ OAL_STATIC oal_int32 wal_set_mac_addr(oal_net_device_stru *pst_net_dev)
         {
             /* 产生P2P device MAC 地址，将本地mac 地址bit 设置为1 */
             auc_primary_mac_addr[0] |= 0x02;
-            oal_set_mac_addr((oal_uint8 *)OAL_NETDEVICE_MAC_ADDR(pst_net_dev), auc_primary_mac_addr);
+            eth_hw_addr_set(pst_net_dev, auc_primary_mac_addr);
 
             break;
         }
@@ -12856,7 +12856,7 @@ OAL_STATIC oal_int32 wal_set_mac_addr(oal_net_device_stru *pst_net_dev)
             auc_primary_mac_addr[2]=0x02;
 #endif /* #ifdef _PRE_PLAT_FEATURE_CUSTOMIZE */
 
-            oal_set_mac_addr((oal_uint8 *)OAL_NETDEVICE_MAC_ADDR(pst_net_dev), auc_primary_mac_addr);
+            eth_hw_addr_set(pst_net_dev, auc_primary_mac_addr);
             break;
         }
     }
@@ -12866,7 +12866,7 @@ OAL_STATIC oal_int32 wal_set_mac_addr(oal_net_device_stru *pst_net_dev)
     auc_primary_mac_addr[1]=0x11;
     auc_primary_mac_addr[2]=0x02;
 
-    oal_set_mac_addr((oal_uint8 *)OAL_NETDEVICE_MAC_ADDR(pst_net_dev), auc_primary_mac_addr);
+    eth_hw_addr_set(pst_net_dev, auc_primary_mac_addr);
 #endif
 
     return OAL_SUCC;
