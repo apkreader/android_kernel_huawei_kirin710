@@ -7,6 +7,9 @@
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/usb/gadget.h>
+
+#include "core.h"
 
 #define CRG_BACKUP_ENABLE	0x50
 #define CRG_BACKUP_DISABLE	0x54
@@ -40,6 +43,36 @@ struct kirin710_dwc3 {
 	void __iomem *crg;
 	bool backup_clock;
 };
+
+static struct device *kirin710_dwc3_dev;
+
+static int kirin710_dwc3_match_child(struct device *dev, void *data)
+{
+	return of_device_is_compatible(dev->of_node, "snps,dwc3");
+}
+
+void kirin710_dwc3_vbus_notify(bool vbus_online)
+{
+	struct device *child;
+	struct dwc3 *dwc;
+
+	if (!kirin710_dwc3_dev)
+		return;
+
+	child = device_find_child(kirin710_dwc3_dev, NULL,
+				  kirin710_dwc3_match_child);
+	if (!child)
+		return;
+
+	dwc = platform_get_drvdata(to_platform_device(child));
+	if (dwc && dwc->gadget) {
+		dev_info(child, "Kirin 710 VBUS %s -> notifying UDC\n",
+			 vbus_online ? "connected" : "disconnected");
+		usb_udc_vbus_handler(dwc->gadget, vbus_online);
+	}
+	put_device(child);
+}
+EXPORT_SYMBOL_GPL(kirin710_dwc3_vbus_notify);
 
 static void __iomem *kirin710_dwc3_map(struct device *dev, const char *compatible,
 				       unsigned int last_reg)
@@ -95,6 +128,8 @@ static int kirin710_dwc3_refclk_enable(struct kirin710_dwc3 *usb,
 static void kirin710_dwc3_power_off(void *data)
 {
 	struct kirin710_dwc3 *usb = data;
+
+	kirin710_dwc3_dev = NULL;
 
 	writel(USB_RST_CORE, usb->crg + CRG_RST_ENABLE);
 	writel(USB_RST_PHY, usb->crg + CRG_RST_ENABLE);
@@ -183,6 +218,7 @@ static int kirin710_dwc3_probe(struct platform_device *pdev)
 	usleep_range(1000, 1500);
 	writel(tuning, phy + OTG_PHY_TUNING);
 
+	kirin710_dwc3_dev = dev;
 	return devm_of_platform_populate(dev);
 }
 

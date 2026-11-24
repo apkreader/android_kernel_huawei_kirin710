@@ -38,6 +38,7 @@
 #include <linux/workqueue.h>
 
 extern struct spmi_device *kirin710_pmic_get_sdev(void);
+extern void kirin710_dwc3_vbus_notify(bool vbus_online);
 extern struct spi_controller *marie_get_spi1_ctlr(void);
 extern int kirin710_xfreq_send_mhz(u32 cmd0, u32 mhz);
 
@@ -1433,21 +1434,77 @@ static struct i2c_driver marie_lm36274_driver = {
 };
 
 /* =========================================================================
- * 5. HI6555v200 SPMI Battery & USB Power Supply
+ * 5. HI6555v200 SPMI Battery (Hardware Coulomb Counter) & USB Power Supply
  * ========================================================================= */
 
 #define PMIC_STATUS0_REG	0x006
+#define PMIC_STATUS1_REG	0x007
 #define PMIC_HRST_REG6_REG	0x1da
 #define PMIC_CURRENT_0_REG	0x2d2
 #define PMIC_V_OUT_0_REG	0x2d4
+#define PMIC_CL_OUT0_REG	0x2d8
+#define PMIC_CL_IN0_REG		0x2dc
+#define PMIC_CLJ_CTRL_REGS2_REG	0x331
+
+#define MARIE_BAT_VBAT_MAX_UV	4400000
+#define MARIE_BAT_FCC_UAH	3240000	/* Rated FCC from P30 lite DT (3240 mAh) */
+#define MARIE_BAT_DESIGN_UAH	3340000	/* Typical design capacity (3340 mAh) */
+#define MARIE_BAT_RBATT_MOHM	130	/* Internal resistance for OCV estimate */
+#define MARIE_BAT_POLL_MS	1000
+#define MARIE_BAT_SAMPLE_TICKS	5	/* 5s coulomb integration cadence */
+
+struct marie_ocv_pt {
+	int mv;
+	int cap;
+};
+
+/* Factory 4.40V HV Li-Po OCV curve (25C) from P30 lite (marie) DT profiles */
+static const struct marie_ocv_pt marie_ocv_table[] = {
+	{ 4345, 100 }, { 4285,  95 }, { 4227,  90 }, { 4170,  85 },
+	{ 4116,  80 }, { 4065,  75 }, { 4018,  70 }, { 3974,  65 },
+	{ 3928,  60 }, { 3881,  55 }, { 3849,  50 }, { 3824,  45 },
+	{ 3802,  40 }, { 3785,  35 }, { 3765,  30 }, { 3742,  25 },
+	{ 3721,  20 }, { 3692,  15 }, { 3663,  10 }, { 3659,   9 },
+	{ 3653,   8 }, { 3646,   7 }, { 3634,   6 }, { 3608,   5 },
+	{ 3567,   4 }, { 3516,   3 }, { 3451,   2 }, { 3358,   1 },
+	{ 3200,   0 },
+};
 
 struct marie_battery {
 	struct spmi_device *sdev;
 	struct power_supply *bat_psy;
 	struct power_supply *usb_psy;
+	struct delayed_work poll_work;
+	struct mutex lock;
+	int vbat_uv;
+	int i_out_ua;	/* >0 discharging, <0 charging (HI6555v200 convention) */
+	int ocv_uv;
+	s64 rem_uah;	/* Coulomb-counted remaining charge in uAh */
+	u32 cl_out_prev;
+	u32 cl_in_prev;
+	int cap;
+	int status;
+	bool usb_online;
+	unsigned int poll_ticks;
+	ktime_t last_sample_kt;
 };
 
 static struct marie_battery marie_bat;
+
+static int marie_bat_read_u32(struct spmi_device *sdev, u16 reg, u32 *out)
+{
+	u8 b[4] = { 0 };
+	int i;
+
+	if (!sdev)
+		return -ENODEV;
+	for (i = 0; i < 4; i++) {
+		if (spmi_ext_register_readl(sdev, reg + i, &b[i], 1))
+			return -EIO;
+	}
+	*out = (u32)b[0] | ((u32)b[1] << 8) | ((u32)b[2] << 16) | ((u32)b[3] << 24);
+	return 0;
+}
 
 static int marie_bat_read_uv(struct spmi_device *sdev)
 {
@@ -1461,33 +1518,73 @@ static int marie_bat_read_uv(struct spmi_device *sdev)
 	    spmi_ext_register_readl(sdev, PMIC_V_OUT_0_REG + 1, &hi, 1))
 		return 3850000;
 
+	/* HI6555v200: 15-bit little-endian ADC, 1 LSB = 2400000 / 10661 uV */
 	raw = (s16)(((u16)hi << 8) | lo) & 0x7fff;
 	uv = div_s64((s64)raw * 2400000LL, 10661);
-	if (uv < 2800000 || uv > 4600000) {
-		/* Try big-endian fallback just in case */
-		raw = (s16)(((u16)lo << 8) | hi) & 0x7fff;
-		uv = div_s64((s64)raw * 2400000LL, 10661);
-	}
 	if (uv < 2800000 || uv > 4600000)
 		return 3850000;
 	return (int)uv;
 }
 
-static int marie_bat_uv_to_cap(int uv)
+static int marie_bat_read_iout_ua(struct spmi_device *sdev)
 {
-	int mv = uv / 1000;
+	u8 lo = 0, hi = 0;
+	s16 raw;
+	s64 ua;
 
-	if (mv <= 3400)
-		return 1;
-	if (mv >= 4200)
+	if (!sdev)
+		return 0;
+	if (spmi_ext_register_readl(sdev, PMIC_CURRENT_0_REG, &lo, 1) ||
+	    spmi_ext_register_readl(sdev, PMIC_CURRENT_0_REG + 1, &hi, 1))
+		return 0;
+
+	/*
+	 * HI6555v200: 16-bit signed little-endian current ADC (r_coul_mohm=10).
+	 * Positive = discharging (OUT of battery), Negative = charging (INTO battery).
+	 * 1 LSB = 5,000,000 / 10661 uA (~469 uA).
+	 */
+	raw = (s16)(((u16)hi << 8) | lo);
+	ua = div_s64((s64)raw * 5000000LL, 10661);
+	if (ua < -6000000 || ua > 6000000)
+		return 0;
+	return (int)ua;
+}
+
+static u64 marie_bat_coul_bit_uah(struct spmi_device *sdev)
+{
+	u8 st1 = 0;
+
+	if (sdev && !spmi_ext_register_readl(sdev, PMIC_STATUS1_REG, &st1, 1) &&
+	    (st1 & BIT(2)))
+		return 143127ULL;	/* 32K clock mode */
+	return 143153ULL;		/* DCXO 586 mode */
+}
+
+static int marie_bat_ocv_to_cap(int ocv_uv)
+{
+	int mv = ocv_uv / 1000;
+	size_t i;
+
+	if (mv >= marie_ocv_table[0].mv)
 		return 100;
-	if (mv < 3700)
-		return 1 + (mv - 3400) * 19 / 300;
-	if (mv < 3850)
-		return 20 + (mv - 3700) * 30 / 150;
-	if (mv < 4050)
-		return 50 + (mv - 3850) * 35 / 200;
-	return 85 + (mv - 4050) * 15 / 150;
+	if (mv <= marie_ocv_table[ARRAY_SIZE(marie_ocv_table) - 1].mv)
+		return 0;
+
+	for (i = 0; i < ARRAY_SIZE(marie_ocv_table) - 1; i++) {
+		int hi_mv = marie_ocv_table[i].mv;
+		int lo_mv = marie_ocv_table[i + 1].mv;
+
+		if (mv >= lo_mv) {
+			int hi_cap = marie_ocv_table[i].cap;
+			int lo_cap = marie_ocv_table[i + 1].cap;
+			int span = hi_mv - lo_mv;
+
+			if (span <= 0)
+				return hi_cap;
+			return lo_cap + ((mv - lo_mv) * (hi_cap - lo_cap) + span / 2) / span;
+		}
+	}
+	return 0;
 }
 
 static bool marie_usb_is_online(struct spmi_device *sdev)
@@ -1502,6 +1599,197 @@ static bool marie_usb_is_online(struct spmi_device *sdev)
 	return !!(st & BIT(1));
 }
 
+static void marie_bat_save_soc(struct spmi_device *sdev, int cap)
+{
+	u8 val = (u8)(0x80 | clamp(cap, 0, 100));
+
+	if (sdev)
+		spmi_ext_register_writel(sdev, PMIC_HRST_REG6_REG, &val, 1);
+}
+
+static int marie_bat_calc_status(bool usb, int cap, int vbat_uv, int i_out_ua)
+{
+	if (!usb)
+		return POWER_SUPPLY_STATUS_DISCHARGING;
+	if (cap >= 100 && (vbat_uv >= 4340000 || i_out_ua > -150000))
+		return POWER_SUPPLY_STATUS_FULL;
+	return POWER_SUPPLY_STATUS_CHARGING;
+}
+
+static void marie_bat_update_cap_from_rem(struct marie_battery *mb)
+{
+	const s64 one_pct = MARIE_BAT_FCC_UAH / 100;
+	const s64 hyst = MARIE_BAT_FCC_UAH / 300;	/* ~0.33% deadband (~11 mAh) */
+
+	mb->rem_uah = clamp_t(s64, mb->rem_uah, 0, MARIE_BAT_FCC_UAH);
+
+	if (mb->rem_uah >= MARIE_BAT_FCC_UAH) {
+		mb->cap = 100;
+		return;
+	}
+	if (mb->rem_uah <= 0) {
+		mb->cap = 0;
+		return;
+	}
+
+	while (mb->cap < 100 &&
+	       mb->rem_uah >= (s64)(mb->cap + 1) * one_pct + hyst)
+		mb->cap++;
+
+	while (mb->cap > 0 &&
+	       mb->rem_uah <= (s64)mb->cap * one_pct - hyst)
+		mb->cap--;
+}
+
+static void marie_bat_sample_locked(struct marie_battery *mb, bool init)
+{
+	int vbat_uv, i_out_ua, ir_uv, ocv_uv, ocv_cap;
+	u32 cl_out = 0, cl_in = 0;
+	ktime_t now_kt = ktime_get_boottime();
+	int prev_cap = mb->cap;
+
+	vbat_uv = marie_bat_read_uv(mb->sdev);
+	i_out_ua = marie_bat_read_iout_ua(mb->sdev);
+
+	ir_uv = clamp_t(int, (int)div_s64((s64)i_out_ua * MARIE_BAT_RBATT_MOHM, 1000),
+			-300000, 300000);
+	ocv_uv = clamp(vbat_uv + ir_uv, 3000000, 4450000);
+	ocv_cap = marie_bat_ocv_to_cap(ocv_uv);
+
+	mb->vbat_uv = vbat_uv;
+	mb->i_out_ua = i_out_ua;
+	mb->ocv_uv = ocv_uv;
+
+	if (init) {
+		u8 hrst6 = 0;
+		int init_cap = ocv_cap;
+
+		if (!spmi_ext_register_readl(mb->sdev, PMIC_HRST_REG6_REG, &hrst6, 1) &&
+		    (hrst6 & 0x80)) {
+			int saved_cap = hrst6 & 0x7f;
+
+			if (saved_cap <= 100 && abs(saved_cap - ocv_cap) <= 4)
+				init_cap = saved_cap;
+		}
+
+		mb->cap = init_cap;
+		/* Center inside the percentage bucket */
+		mb->rem_uah = clamp_t(s64,
+				      (s64)init_cap * (MARIE_BAT_FCC_UAH / 100) +
+				      (MARIE_BAT_FCC_UAH / 200),
+				      0, MARIE_BAT_FCC_UAH);
+		marie_bat_read_u32(mb->sdev, PMIC_CL_OUT0_REG, &mb->cl_out_prev);
+		marie_bat_read_u32(mb->sdev, PMIC_CL_IN0_REG, &mb->cl_in_prev);
+		mb->last_sample_kt = now_kt;
+		marie_bat_save_soc(mb->sdev, mb->cap);
+	} else {
+		s64 dt_ms = ktime_ms_delta(now_kt, mb->last_sample_kt);
+		s64 delta_uah = 0;
+		bool hw_coul_ok = false;
+
+		mb->last_sample_kt = now_kt;
+		if (dt_ms < 0 || dt_ms > 3600000)
+			dt_ms = MARIE_BAT_SAMPLE_TICKS * MARIE_BAT_POLL_MS;
+
+		if (!marie_bat_read_u32(mb->sdev, PMIC_CL_OUT0_REG, &cl_out) &&
+		    !marie_bat_read_u32(mb->sdev, PMIC_CL_IN0_REG, &cl_in)) {
+			u32 d_out = cl_out - mb->cl_out_prev;
+			u32 d_in = cl_in - mb->cl_in_prev;
+
+			mb->cl_out_prev = cl_out;
+			mb->cl_in_prev = cl_in;
+
+			if (d_out != 0 || d_in != 0) {
+				u64 bit_uah = marie_bat_coul_bit_uah(mb->sdev);
+				s64 out_uah = div_s64((s64)d_out * bit_uah, 10000000LL);
+				s64 in_uah = div_s64((s64)d_in * bit_uah, 10000000LL);
+
+				/* Sanity bound: max 6A over dt_ms */
+				s64 max_uah = div_s64(6000000LL * dt_ms, 3600000LL) + 5000;
+
+				if (out_uah <= max_uah && in_uah <= max_uah) {
+					delta_uah = in_uah - out_uah;
+					hw_coul_ok = true;
+				}
+			}
+		}
+
+		/* Fallback to software current integration if HW counter didn't tick */
+		if (!hw_coul_ok && dt_ms > 0)
+			delta_uah = div_s64((s64)(-i_out_ua) * dt_ms, 3600000LL);
+
+		mb->rem_uah += delta_uah;
+
+		/* End-of-charge (CV taper near 4.40V) -> smoothly finish to 100% */
+		if (mb->usb_online && vbat_uv >= 4355000 && i_out_ua > -150000) {
+			mb->rem_uah += 1500;
+		} else if (!mb->usb_online && vbat_uv <= 3250000) {
+			/* Low-voltage cutoff protection -> reach 0% before UVLO */
+			mb->rem_uah -= 3000;
+		} else if (abs(i_out_ua) < 250000) {
+			/* Very gentle relaxed-OCV drift alignment (~0.1%/min max) */
+			s64 ocv_uah = (s64)ocv_cap * (MARIE_BAT_FCC_UAH / 100);
+			s64 diff = ocv_uah - mb->rem_uah;
+			const s64 tol = (s64)MARIE_BAT_FCC_UAH * 4 / 100;
+
+			if (diff > tol)
+				mb->rem_uah += 300;
+			else if (diff < -tol)
+				mb->rem_uah -= 300;
+		}
+
+		marie_bat_update_cap_from_rem(mb);
+		if (mb->cap != prev_cap)
+			marie_bat_save_soc(mb->sdev, mb->cap);
+	}
+
+	mb->status = marie_bat_calc_status(mb->usb_online, mb->cap,
+					   mb->vbat_uv, mb->i_out_ua);
+}
+
+static void marie_bat_poll_fn(struct work_struct *work)
+{
+	struct marie_battery *mb = container_of(to_delayed_work(work),
+						struct marie_battery, poll_work);
+	bool usb_now, usb_changed = false, bat_changed = false;
+	int prev_cap, prev_status;
+
+	usb_now = marie_usb_is_online(mb->sdev);
+
+	mutex_lock(&mb->lock);
+	mb->poll_ticks++;
+	prev_cap = mb->cap;
+	prev_status = mb->status;
+
+	if (usb_now != mb->usb_online) {
+		mb->usb_online = usb_now;
+		usb_changed = true;
+		marie_bat_sample_locked(mb, false);
+		bat_changed = true;
+		pr_info("MARIE_BAT: USB %s (vbat=%d mV cur=%d mA rem=%lld mAh cap=%d%% cl_out=%u cl_in=%u)\n",
+			usb_now ? "connected" : "disconnected",
+			mb->vbat_uv / 1000, -mb->i_out_ua / 1000,
+			div_s64(mb->rem_uah, 1000), mb->cap,
+			mb->cl_out_prev, mb->cl_in_prev);
+	} else if ((mb->poll_ticks % MARIE_BAT_SAMPLE_TICKS) == 0) {
+		marie_bat_sample_locked(mb, false);
+		if (mb->cap != prev_cap || mb->status != prev_status ||
+		    (mb->poll_ticks % 60) == 0)
+			bat_changed = true;
+	}
+	mutex_unlock(&mb->lock);
+
+	if (usb_changed) {
+		kirin710_dwc3_vbus_notify(usb_now);
+		if (!IS_ERR_OR_NULL(mb->usb_psy))
+			power_supply_changed(mb->usb_psy);
+	}
+	if (bat_changed && !IS_ERR_OR_NULL(mb->bat_psy))
+		power_supply_changed(mb->bat_psy);
+
+	schedule_delayed_work(&mb->poll_work, msecs_to_jiffies(MARIE_BAT_POLL_MS));
+}
+
 static enum power_supply_property marie_bat_props[] = {
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_HEALTH,
@@ -1509,6 +1797,9 @@ static enum power_supply_property marie_bat_props[] = {
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_CHARGE_COUNTER,
 	POWER_SUPPLY_PROP_TEMP,
 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
 };
@@ -1518,45 +1809,49 @@ static int marie_bat_get_prop(struct power_supply *psy,
 			      union power_supply_propval *val)
 {
 	struct marie_battery *mb = power_supply_get_drvdata(psy);
-	int uv, cap;
-	bool usb;
 
+	mutex_lock(&mb->lock);
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
-		usb = marie_usb_is_online(mb->sdev);
-		uv = marie_bat_read_uv(mb->sdev);
-		cap = marie_bat_uv_to_cap(uv);
-		if (usb)
-			val->intval = (cap >= 100) ? POWER_SUPPLY_STATUS_FULL :
-						     POWER_SUPPLY_STATUS_CHARGING;
-		else
-			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
-		return 0;
+		val->intval = mb->status;
+		break;
 	case POWER_SUPPLY_PROP_HEALTH:
 		val->intval = POWER_SUPPLY_HEALTH_GOOD;
-		return 0;
+		break;
 	case POWER_SUPPLY_PROP_PRESENT:
 		val->intval = 1;
-		return 0;
+		break;
 	case POWER_SUPPLY_PROP_TECHNOLOGY:
 		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
-		return 0;
+		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
-		uv = marie_bat_read_uv(mb->sdev);
-		val->intval = marie_bat_uv_to_cap(uv);
-		return 0;
+		val->intval = mb->cap;
+		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
-		val->intval = marie_bat_read_uv(mb->sdev);
-		return 0;
+		val->intval = mb->vbat_uv;
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
+		val->intval = MARIE_BAT_VBAT_MAX_UV;
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		/* Standard Linux/Android ABI: positive = charging, negative = discharging */
+		val->intval = -mb->i_out_ua;
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
+		val->intval = (int)mb->rem_uah;
+		break;
 	case POWER_SUPPLY_PROP_TEMP:
 		val->intval = 280;
-		return 0;
+		break;
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
-		val->intval = 3340000;
-		return 0;
+		val->intval = MARIE_BAT_DESIGN_UAH;
+		break;
 	default:
+		mutex_unlock(&mb->lock);
 		return -EINVAL;
 	}
+	mutex_unlock(&mb->lock);
+	return 0;
 }
 
 static const struct power_supply_desc marie_bat_desc = {
@@ -1578,7 +1873,9 @@ static int marie_usb_get_prop(struct power_supply *psy,
 	struct marie_battery *mb = power_supply_get_drvdata(psy);
 
 	if (psp == POWER_SUPPLY_PROP_ONLINE) {
-		val->intval = marie_usb_is_online(mb->sdev) ? 1 : 0;
+		mutex_lock(&mb->lock);
+		val->intval = mb->usb_online ? 1 : 0;
+		mutex_unlock(&mb->lock);
 		return 0;
 	}
 	return -EINVAL;
@@ -1595,23 +1892,44 @@ static const struct power_supply_desc marie_usb_desc = {
 static void marie_battery_register(void)
 {
 	struct power_supply_config cfg = { .drv_data = &marie_bat };
-	u8 lo = 0, hi = 0, st = 0, hrst6 = 0;
-	int uv;
+	u8 st = 0, st1 = 0, clj = 0, hrst6 = 0;
 
 	marie_bat.sdev = kirin710_pmic_get_sdev();
 	if (!marie_bat.sdev)
 		return;
 
-	spmi_ext_register_readl(marie_bat.sdev, PMIC_V_OUT_0_REG, &lo, 1);
-	spmi_ext_register_readl(marie_bat.sdev, PMIC_V_OUT_0_REG + 1, &hi, 1);
+	mutex_init(&marie_bat.lock);
 	spmi_ext_register_readl(marie_bat.sdev, PMIC_STATUS0_REG, &st, 1);
+	spmi_ext_register_readl(marie_bat.sdev, PMIC_STATUS1_REG, &st1, 1);
+	spmi_ext_register_readl(marie_bat.sdev, PMIC_CLJ_CTRL_REGS2_REG, &clj, 1);
 	spmi_ext_register_readl(marie_bat.sdev, PMIC_HRST_REG6_REG, &hrst6, 1);
-	uv = marie_bat_read_uv(marie_bat.sdev);
+
+	/* Ensure HI6555v200 hardware coulomb counter is enabled */
+	if (!(clj & BIT(0))) {
+		u8 en = clj | BIT(0);
+		spmi_ext_register_writel(marie_bat.sdev, PMIC_CLJ_CTRL_REGS2_REG, &en, 1);
+	}
+
+	mutex_lock(&marie_bat.lock);
+	marie_bat.usb_online = !!(st & BIT(1));
+	marie_bat_sample_locked(&marie_bat, true);
+	mutex_unlock(&marie_bat.lock);
 
 	marie_bat.bat_psy = power_supply_register(&marie_bat.sdev->dev, &marie_bat_desc, &cfg);
 	marie_bat.usb_psy = power_supply_register(&marie_bat.sdev->dev, &marie_usb_desc, &cfg);
-	pr_info("MARIE_BAT: registered Battery/USB (vout=%02x,%02x -> %d uV (%d%%), st0=0x%02x hrst6=0x%02x)\n",
-		lo, hi, uv, marie_bat_uv_to_cap(uv), st, hrst6);
+
+	if (!marie_bat.usb_online)
+		kirin710_dwc3_vbus_notify(false);
+
+	INIT_DELAYED_WORK(&marie_bat.poll_work, marie_bat_poll_fn);
+	schedule_delayed_work(&marie_bat.poll_work, msecs_to_jiffies(MARIE_BAT_POLL_MS));
+
+	pr_info("MARIE_BAT: registered Battery/USB (vbat=%d mV cur=%d mA ocv=%d mV -> %d%% rem=%lld mAh, cl_out=%u cl_in=%u clj=0x%02x st0=0x%02x st1=0x%02x hrst6=0x%02x)\n",
+		marie_bat.vbat_uv / 1000, -marie_bat.i_out_ua / 1000,
+		marie_bat.ocv_uv / 1000, marie_bat.cap,
+		div_s64(marie_bat.rem_uah, 1000),
+		marie_bat.cl_out_prev, marie_bat.cl_in_prev,
+		clj, st, st1, hrst6);
 }
 
 /* =========================================================================
