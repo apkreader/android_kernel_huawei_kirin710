@@ -2834,6 +2834,10 @@ static int pl011_probe(struct amba_device *dev, const struct amba_id *id)
 	int portnr, ret;
 	u32 val;
 
+	/* Skip Kirin 710 boot-console UART (clock-gated at 0xfdf02000). */
+	if (dev->res.start == 0xfdf02000)
+		return -ENODEV;
+
 	portnr = pl011_find_free_port();
 	if (portnr < 0)
 		return portnr;
