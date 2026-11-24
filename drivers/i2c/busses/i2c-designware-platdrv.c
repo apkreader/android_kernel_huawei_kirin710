@@ -215,8 +215,16 @@ static int dw_i2c_plat_probe(struct platform_device *pdev)
 
 	if (of_device_is_compatible(device->of_node, "hisilicon,designware-i2c")) {
 		struct resource *r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-		if (!r || r->start != 0xfdf0c000)
+		if (!r || (r->start != 0xfdf0c000 && r->start != 0xffd6a000))
 			return -ENODEV;
+		if (r->start == 0xffd6a000) {
+			struct clk *c = clk_get(device, "clk_i2c");
+			unsigned long rate = IS_ERR(c) ? 0 : clk_get_rate(c);
+			if (!IS_ERR(c))
+				clk_put(c);
+			if (!rate)
+				return -EPROBE_DEFER;
+		}
 	}
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)

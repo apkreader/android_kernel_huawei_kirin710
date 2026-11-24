@@ -113,6 +113,28 @@ void kirin710_dwc3_vbus_notify(bool vbus_online)
 }
 EXPORT_SYMBOL_GPL(kirin710_dwc3_vbus_notify);
 
+bool kirin710_dwc3_is_configured(void)
+{
+	struct device *child;
+	struct dwc3 *dwc;
+	bool configured = false;
+
+	if (!kirin710_dwc3_dev)
+		return false;
+
+	child = device_find_child(kirin710_dwc3_dev, NULL,
+				  kirin710_dwc3_match_child);
+	if (!child)
+		return false;
+
+	dwc = platform_get_drvdata(to_platform_device(child));
+	if (dwc && dwc->gadget)
+		configured = (dwc->gadget->state == USB_STATE_CONFIGURED);
+	put_device(child);
+	return configured;
+}
+EXPORT_SYMBOL_GPL(kirin710_dwc3_is_configured);
+
 static void __iomem *kirin710_dwc3_map(struct device *dev, const char *compatible,
 				       unsigned int last_reg)
 {

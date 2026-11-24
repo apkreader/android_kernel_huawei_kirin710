@@ -29,6 +29,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
 #include <linux/reboot.h>
@@ -40,6 +41,7 @@
 extern struct spmi_device *kirin710_pmic_get_sdev(void);
 extern void kirin710_dwc3_vbus_notify(bool vbus_online);
 extern void kirin710_dwc3_typec_set_connected(bool connected);
+extern bool kirin710_dwc3_is_configured(void);
 extern struct spi_controller *marie_get_spi1_ctlr(void);
 extern int kirin710_xfreq_send_mhz(u32 cmd0, u32 mhz);
 
@@ -1445,6 +1447,164 @@ static struct i2c_driver marie_lm36274_driver = {
 };
 
 /* =========================================================================
+ * 4b. HI6523 (SchargerV300) I2C6 Switching Charger IC (huawei,hi6523_charger)
+ * ========================================================================= */
+
+#define HI6523_REG_CHIP_VER0		0x00
+#define HI6523_REG_CHIP_VER5		0x05
+#define HI6523_REG_STATUS0		0x06
+#define HI6523_REG_STATUS1		0x07
+#define HI6523_REG_BUCK_REG0		0x60	/* bits [6:2] buck_ilimit */
+#define HI6523_REG_CHG_REG0		0x90	/* bit 5 chg_en, bit 4 batfet_ctrl */
+#define HI6523_REG_CHG_REG1		0x91	/* bits [4:0] chg_fast_ichg */
+#define HI6523_REG_CHG_REG2		0x92	/* bits [6:3] chg_fast_vchg, [2:0] term_ichg */
+#define HI6523_REG_CHG_REG3		0x93	/* bits [1:0] fastchg_timer */
+#define HI6523_REG_CHG_REG4		0x94	/* bit 2 chg_en_term */
+#define HI6523_REG_SCHG_LOGIC_CTRL	0xa3	/* bit 0 buck_enb (HIZ) */
+#define HI6523_REG_WDT_SOFT_RST		0xe8	/* bit 0 wd_rst_n */
+#define HI6523_REG_WDT_CTRL		0xe9	/* bits [1:0] watchdog_timer */
+
+#define HI6523_ILIMIT_900MA		3	/* 900 mA (PC USB with HW VINDPM) */
+#define HI6523_ILIMIT_2000MA		14	/* 2000 mA (AC / USB-C wall charger) */
+#define HI6523_ICHG_1000MA		9	/* 1000 mA */
+#define HI6523_ICHG_2000MA		14	/* 2000 mA */
+#define HI6523_VCHG_4400MV		12	/* (4400 - 3800) / 50 = 12 */
+#define HI6523_ITERM_150MA		2	/* 150 mA termination */
+
+static DEFINE_MUTEX(marie_hi6523_lock);
+static struct i2c_client *marie_hi6523_client;
+static int marie_hi6523_last_mode = -1;	/* -1=unset, 0=off, 1=pc_usb, 2=ac */
+
+static int hi6523_write_mask(struct i2c_client *client, u8 reg, u8 mask, u8 shift, u8 val)
+{
+	int cur = i2c_smbus_read_byte_data(client, reg);
+	u8 next;
+
+	if (cur < 0)
+		return cur;
+	next = ((u8)cur & ~mask) | ((val << shift) & mask);
+	return i2c_smbus_write_byte_data(client, reg, next);
+}
+
+static bool marie_hi6523_is_charge_done(void)
+{
+	int st0;
+
+	mutex_lock(&marie_hi6523_lock);
+	if (!marie_hi6523_client) {
+		mutex_unlock(&marie_hi6523_lock);
+		return false;
+	}
+	st0 = i2c_smbus_read_byte_data(marie_hi6523_client, HI6523_REG_STATUS0);
+	mutex_unlock(&marie_hi6523_lock);
+	if (st0 < 0)
+		return false;
+	return ((st0 >> 4) & 0x03) == 0x03;
+}
+
+static void marie_hi6523_update(bool vbus_online, bool pc_usb)
+{
+	struct i2c_client *client;
+	int mode = !vbus_online ? 0 : (pc_usb ? 1 : 2);
+	u8 ilim, ichg;
+	int st0, st1, r60, r90, r91, r92;
+
+	mutex_lock(&marie_hi6523_lock);
+	client = marie_hi6523_client;
+	if (!client) {
+		mutex_unlock(&marie_hi6523_lock);
+		return;
+	}
+
+	if (!vbus_online) {
+		marie_hi6523_last_mode = 0;
+		mutex_unlock(&marie_hi6523_lock);
+		return;
+	}
+
+	/* Always ensure WDT is disabled and kicked, HIZ off, 4.40V VREG, charging enabled */
+	ilim = pc_usb ? HI6523_ILIMIT_900MA : HI6523_ILIMIT_2000MA;
+	ichg = pc_usb ? HI6523_ICHG_1000MA : HI6523_ICHG_2000MA;
+
+	hi6523_write_mask(client, HI6523_REG_WDT_CTRL, 0x03, 0, 0x00);
+	hi6523_write_mask(client, HI6523_REG_WDT_SOFT_RST, BIT(0), 0, 1);
+	hi6523_write_mask(client, HI6523_REG_SCHG_LOGIC_CTRL, BIT(0), 0, 0);
+	hi6523_write_mask(client, HI6523_REG_BUCK_REG0, 0x1f << 2, 2, ilim);
+	hi6523_write_mask(client, HI6523_REG_CHG_REG1, 0x1f, 0, ichg);
+	hi6523_write_mask(client, HI6523_REG_CHG_REG2, 0x0f << 3, 3, HI6523_VCHG_4400MV);
+	hi6523_write_mask(client, HI6523_REG_CHG_REG2, 0x07, 0, HI6523_ITERM_150MA);
+	hi6523_write_mask(client, HI6523_REG_CHG_REG3, 0x03, 0, 3);	/* 20h safety timer */
+	hi6523_write_mask(client, HI6523_REG_CHG_REG4, BIT(2), 2, 1);	/* enable termination */
+	hi6523_write_mask(client, HI6523_REG_CHG_REG0, BIT(4), 4, 1);	/* enable BATFET */
+	hi6523_write_mask(client, HI6523_REG_CHG_REG0, BIT(5), 5, 1);	/* enable charging */
+
+	if (mode != marie_hi6523_last_mode) {
+		marie_hi6523_last_mode = mode;
+		st0 = i2c_smbus_read_byte_data(client, HI6523_REG_STATUS0);
+		st1 = i2c_smbus_read_byte_data(client, HI6523_REG_STATUS1);
+		r60 = i2c_smbus_read_byte_data(client, HI6523_REG_BUCK_REG0);
+		r90 = i2c_smbus_read_byte_data(client, HI6523_REG_CHG_REG0);
+		r91 = i2c_smbus_read_byte_data(client, HI6523_REG_CHG_REG1);
+		r92 = i2c_smbus_read_byte_data(client, HI6523_REG_CHG_REG2);
+		pr_info("MARIE_CHG: HI6523 configured mode=%s (IIN=%dmA ICHG=%dmA VREG=4400mV) st0=0x%02x st1=0x%02x r60=0x%02x r90=0x%02x r91=0x%02x r92=0x%02x\n",
+			pc_usb ? "USB" : "AC",
+			pc_usb ? 900 : 2000, pc_usb ? 1000 : 2000,
+			st0 & 0xff, st1 & 0xff, r60 & 0xff, r90 & 0xff, r91 & 0xff, r92 & 0xff);
+	}
+	mutex_unlock(&marie_hi6523_lock);
+}
+
+static int marie_hi6523_probe(struct i2c_client *client)
+{
+	int v0, v5, st0, st1, r60, r90, r91, r92, wdt;
+
+	v0 = i2c_smbus_read_byte_data(client, HI6523_REG_CHIP_VER0);
+	if (v0 < 0) {
+		pr_warn("MARIE_CHG: HI6523 I2C read failed: %d\n", v0);
+		return v0;
+	}
+	v5 = i2c_smbus_read_byte_data(client, HI6523_REG_CHIP_VER5);
+	st0 = i2c_smbus_read_byte_data(client, HI6523_REG_STATUS0);
+	st1 = i2c_smbus_read_byte_data(client, HI6523_REG_STATUS1);
+	r60 = i2c_smbus_read_byte_data(client, HI6523_REG_BUCK_REG0);
+	r90 = i2c_smbus_read_byte_data(client, HI6523_REG_CHG_REG0);
+	r91 = i2c_smbus_read_byte_data(client, HI6523_REG_CHG_REG1);
+	r92 = i2c_smbus_read_byte_data(client, HI6523_REG_CHG_REG2);
+	wdt = i2c_smbus_read_byte_data(client, HI6523_REG_WDT_CTRL);
+
+	pr_info("MARIE_CHG: HI6523 READY (v0=0x%02x v5=0x%02x st0=0x%02x st1=0x%02x r60=0x%02x r90=0x%02x r91=0x%02x r92=0x%02x wdt=0x%02x)\n",
+		v0 & 0xff, v5 & 0xff, st0 & 0xff, st1 & 0xff,
+		r60 & 0xff, r90 & 0xff, r91 & 0xff, r92 & 0xff, wdt & 0xff);
+
+	mutex_lock(&marie_hi6523_lock);
+	marie_hi6523_client = client;
+	marie_hi6523_last_mode = -1;
+	mutex_unlock(&marie_hi6523_lock);
+
+	marie_hi6523_update(true, kirin710_dwc3_is_configured());
+	return 0;
+}
+
+static const struct of_device_id marie_hi6523_of_match[] = {
+	{ .compatible = "huawei,hi6523_charger" },
+	{ }
+};
+
+static const struct i2c_device_id marie_hi6523_id[] = {
+	{ "hi6523_charger", 0 },
+	{ }
+};
+
+static struct i2c_driver marie_hi6523_driver = {
+	.driver = {
+		.name = "marie-hi6523",
+		.of_match_table = marie_hi6523_of_match,
+	},
+	.probe = marie_hi6523_probe,
+	.id_table = marie_hi6523_id,
+};
+
+/* =========================================================================
  * 5. HI6555v200 SPMI Battery (Hardware Coulomb Counter) & USB Power Supply
  * ========================================================================= */
 
@@ -1623,7 +1783,8 @@ static int marie_bat_calc_status(bool usb, int cap, int vbat_uv, int i_out_ua)
 {
 	if (!usb)
 		return POWER_SUPPLY_STATUS_DISCHARGING;
-	if (cap >= 100 && (vbat_uv >= 4340000 || i_out_ua > -150000))
+	if (marie_hi6523_is_charge_done() ||
+	    (cap >= 100 && (vbat_uv >= 4340000 || i_out_ua > -150000)))
 		return POWER_SUPPLY_STATUS_FULL;
 	return POWER_SUPPLY_STATUS_CHARGING;
 }
@@ -1732,8 +1893,8 @@ static void marie_bat_sample_locked(struct marie_battery *mb, bool init)
 
 		mb->rem_uah += delta_uah;
 
-		/* End-of-charge (CV taper near 4.40V) -> smoothly finish to 100% */
-		if (mb->usb_online && vbat_uv >= 4355000 && i_out_ua > -150000) {
+		/* End-of-charge (HI6523 CHG_DONE or CV taper near 4.40V) -> finish to 100% */
+		if (mb->usb_online && (marie_hi6523_is_charge_done() || (vbat_uv >= 4355000 && i_out_ua > -150000))) {
 			mb->rem_uah += 1500;
 		} else if (!mb->usb_online && vbat_uv <= 3250000) {
 			/* Low-voltage cutoff protection -> reach 0% before UVLO */
@@ -1800,6 +1961,7 @@ static void marie_bat_poll_fn(struct work_struct *work)
 	}
 	mutex_unlock(&mb->lock);
 
+	marie_hi6523_update(usb_now, kirin710_dwc3_is_configured());
 	if (usb_changed) {
 		kirin710_dwc3_vbus_notify(usb_now);
 		if (!IS_ERR_OR_NULL(mb->usb_psy))
@@ -2154,7 +2316,56 @@ static void marie_deferred_boot_fn(struct work_struct *work)
 		of_node_put(clk_np);
 	}
 
+	/* Enable IOMCU I2C6 (0xFFD6A000): release reset & enable clock in iomcu_crgctrl (0xFFD7E000) */
+	{
+		void __iomem *iomcu_crg = ioremap(0xffd7e000, 0x1000);
+		void __iomem *pmx6 = ioremap(0xfff11000, 0x1000);
+
+		if (iomcu_crg) {
+			writel(BIT(27), iomcu_crg + 0x24); /* RSTDIS bit 27 */
+			writel(BIT(27), iomcu_crg + 0x10); /* PEREN0 bit 27 */
+			dsb(sy);
+			udelay(10);
+			iounmap(iomcu_crg);
+		}
+		if (pmx6) {
+			writel(0x1, pmx6 + 0x710); /* GPIO212 -> I2C6_SCL */
+			writel(0x1, pmx6 + 0x714); /* GPIO213 -> I2C6_SDA */
+			dsb(sy);
+			iounmap(pmx6);
+		}
+	}
+
+	/* clk_i2c6 is a fixed-factor /4 clock whose parent clk_i2c6_gt has no driver */
+	clk_np = of_find_node_by_path("/clocks@0/iomcu_crgctrl@0xFFD7E000/clk_i2c6_gt");
+	if (clk_np) {
+		hw = clk_hw_register_fixed_rate(NULL, "clk_i2c6_gt", NULL, 0, 132000000);
+		if (!IS_ERR(hw)) {
+			int cret = of_clk_add_hw_provider(clk_np, of_clk_hw_simple_get, hw);
+			pr_info("MARIE_CHG: registered clk_i2c6_gt (132MHz -> i2c6 33MHz) = %d\n", cret);
+			fw_devlink_purge_absent_suppliers(of_fwnode_handle(clk_np));
+		} else {
+			pr_warn("MARIE_CHG: clk_i2c6_gt register err=%ld\n", PTR_ERR(hw));
+		}
+		of_node_put(clk_np);
+	}
+
 	i2c_add_driver(&marie_lm36274_driver);
+	i2c_add_driver(&marie_hi6523_driver);
+
+	/* Re-attach ffd6a000.i2c if its early probe failed before clk_i2c6_gt existed */
+	clk_np = of_find_node_by_path("/amba/i2c@FFD6A000");
+	if (clk_np) {
+		struct platform_device *i2c6_pdev = of_find_device_by_node(clk_np);
+		if (i2c6_pdev) {
+			if (!i2c6_pdev->dev.driver) {
+				int aret = device_attach(&i2c6_pdev->dev);
+				pr_info("MARIE_CHG: device_attach(ffd6a000.i2c) = %d\n", aret);
+			}
+			put_device(&i2c6_pdev->dev);
+		}
+		of_node_put(clk_np);
+	}
 	marie_battery_register();
 	marie_cpufreq_register();
 	register_reboot_notifier(&marie_reboot_nb);
