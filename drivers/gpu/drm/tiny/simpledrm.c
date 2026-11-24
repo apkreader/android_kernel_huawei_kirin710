@@ -1,3 +1,4 @@
+#include <linux/init.h>
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/clk.h>
@@ -14,6 +15,8 @@
 #include <linux/dma-mapping.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/vmalloc.h>
+#include <linux/font.h>
+#include <generated/utsrelease.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
 
@@ -138,16 +141,28 @@ static void marie_simpledrm_disable_vblank(struct drm_crtc *crtc)
 {
 }
 
+extern int marie_lm36274_set_brightness(unsigned int brightness);
+
+static bool marie_is_charger_mode(void)
+{
+	return saved_command_line &&
+	       strstr(saved_command_line, "androidboot.mode=charger") != NULL;
+}
+
 static void marie_simpledrm_crtc_atomic_enable(struct drm_crtc *crtc,
 					       struct drm_atomic_state *state)
 {
 	if (crtc->dev->num_crtcs)
 		drm_crtc_vblank_on(crtc);
+	if (marie_is_charger_mode())
+		marie_lm36274_set_brightness(128);
 }
 
 static void marie_simpledrm_crtc_atomic_disable(struct drm_crtc *crtc,
 						struct drm_atomic_state *state)
 {
+	if (marie_is_charger_mode())
+		marie_lm36274_set_brightness(0);
 	if (crtc->dev->num_crtcs)
 		drm_crtc_vblank_off(crtc);
 }
@@ -191,7 +206,8 @@ static int marie_simpledrm_dumb_create(struct drm_file *file_priv,
 				       struct drm_device *dev,
 				       struct drm_mode_create_dumb *args)
 {
-	if (marie_cma_ready && args->width >= 1080 && args->height >= 2312 && args->bpp == 32) {
+	if (file_priv && file_priv->filp && marie_cma_ready &&
+	    args->width >= 1080 && args->height >= 2312 && args->bpp == 32) {
 		if (!drm_gem_dma_dumb_create(file_priv, dev, args))
 			return 0;
 	}
@@ -1022,6 +1038,59 @@ static void simpledrm_primary_plane_helper_atomic_update(struct drm_plane *plane
 				}
 			}
 		} else if (sdev->format->format == DRM_FORMAT_XRGB8888 &&
+			   fb->format->format == DRM_FORMAT_RGB565 &&
+			   !dst.is_iomem && !shadow_plane_state->data[0].is_iomem) {
+			unsigned int y, x, h = drm_rect_height(&damage);
+			unsigned int w = drm_rect_width(&damage);
+			const u8 *src_base = (const u8 *)shadow_plane_state->data[0].vaddr +
+					     fb->offsets[0] + damage.y1 * fb->pitches[0] + damage.x1 * 2;
+			bool do_flip = marie_dss_tribuf &&
+				       (w == sdev->mode.hdisplay && h == sdev->mode.vdisplay);
+			unsigned int target_idx = 0;
+			u8 *dst_base;
+
+			if (marie_dss_tribuf) {
+				unsigned long dflags;
+				unsigned int f_idx, q_idx;
+
+				spin_lock_irqsave(&marie_dss_lock, dflags);
+				f_idx = marie_front_idx;
+				q_idx = marie_queued_idx;
+				spin_unlock_irqrestore(&marie_dss_lock, dflags);
+				if (do_flip) {
+					for (target_idx = 0; target_idx < 3; target_idx++) {
+						if (target_idx != f_idx && target_idx != q_idx)
+							break;
+					}
+					marie_flip_idx = target_idx;
+					marie_do_flip = true;
+					dst_base = (u8 *)marie_fb_buf[target_idx];
+				} else {
+					target_idx = q_idx;
+					dst_base = (u8 *)marie_fb_buf[target_idx] +
+						   drm_fb_clip_offset(sdev->pitch, sdev->format, &dst_clip);
+				}
+			} else {
+				dst_base = (u8 *)dst.vaddr;
+			}
+
+			for (y = 0; y < h; y++) {
+				const u16 *sp16 = (const u16 *)(src_base + y * fb->pitches[0]);
+				u32 *dp32 = (u32 *)(dst_base + y * sdev->pitch);
+
+				for (x = 0; x < w; x++) {
+					u16 p = sp16[x];
+					u32 r = (p >> 11) & 0x1f;
+					u32 g = (p >> 5) & 0x3f;
+					u32 b = p & 0x1f;
+
+					r = (r << 3) | (r >> 2);
+					g = (g << 2) | (g >> 4);
+					b = (b << 3) | (b >> 2);
+					dp32[x] = 0xff000000U | (r << 16) | (g << 8) | b;
+				}
+			}
+		} else if (sdev->format->format == DRM_FORMAT_XRGB8888 &&
 			   (fb->format->format == DRM_FORMAT_ABGR8888 ||
 			    fb->format->format == DRM_FORMAT_XBGR8888)) {
 			drm_fb_xrgb8888_to_abgr8888(&dst, &sdev->pitch, shadow_plane_state->data,
@@ -1085,6 +1154,8 @@ static void simpledrm_primary_plane_helper_atomic_disable(struct drm_plane *plan
 	/* Clear screen to black if disabled */
 	iosys_map_memset(&sdev->screen_base, 0, 0, sdev->pitch * sdev->mode.vdisplay);
 #ifdef CONFIG_ARM64
+	if (marie_is_charger_mode())
+		marie_lm36274_set_brightness(0);
 	if (!sdev->screen_base.is_iomem) {
 		unsigned long start = (unsigned long)sdev->screen_base.vaddr;
 
@@ -1103,6 +1174,7 @@ static void simpledrm_primary_plane_helper_atomic_disable(struct drm_plane *plan
 				writel(1, marie_dss_base + 0x10128);
 				dsb(st);
 				writel(0, marie_dss_base + 0x10804);
+				marie_queued_idx = 0;
 				spin_unlock_irqrestore(&marie_dss_lock, dflags);
 			}
 		} else {
@@ -1222,6 +1294,152 @@ static struct drm_display_mode simpledrm_mode(unsigned int width,
 	};
 
 	return mode;
+}
+
+
+static inline u32 marie_lerp_rgb(u32 c0, u32 c1, unsigned int num, unsigned int den)
+{
+	u32 r0 = (c0 >> 16) & 0xff, g0 = (c0 >> 8) & 0xff, b0 = c0 & 0xff;
+	u32 r1 = (c1 >> 16) & 0xff, g1 = (c1 >> 8) & 0xff, b1 = c1 & 0xff;
+	u32 r = den ? (r0 * (den - num) + r1 * num) / den : r0;
+	u32 g = den ? (g0 * (den - num) + g1 * num) / den : g0;
+	u32 b = den ? (b0 * (den - num) + b1 * num) / den : b0;
+
+	return 0xff000000U | (r << 16) | (g << 8) | b;
+}
+
+static void marie_draw_banner_line(u8 *fb, unsigned int width, unsigned int height,
+				   unsigned int pitch, const struct font_desc *font,
+				   const char *text, unsigned int y0,
+				   u32 c_start, u32 c_end)
+{
+	const unsigned int scale = 2;
+	const unsigned int gw = 8 * scale;
+	const unsigned int adv = gw + 2;
+	unsigned int len = strlen(text);
+	unsigned int total_w = len ? (len * adv - 2) : 0;
+	unsigned int x0 = (width > total_w) ? ((width - total_w) / 2) : 0;
+	unsigned int i, row, col, sy, sx;
+
+	for (i = 0; i < len; i++) {
+		unsigned char ch = (unsigned char)text[i];
+		const u8 *glyph = (const u8 *)font->data + ((unsigned int)ch * 16U);
+		unsigned int gx = x0 + i * adv;
+
+		for (row = 0; row < 16; row++) {
+			u8 bits = glyph[row];
+
+			if (!bits)
+				continue;
+			for (col = 0; col < 8; col++) {
+				u32 color;
+
+				if (!(bits & (0x80U >> col)))
+					continue;
+				color = marie_lerp_rgb(c_start, c_end,
+						       i * adv + col * scale,
+						       total_w ? total_w : 1);
+				for (sy = 0; sy < scale; sy++) {
+					unsigned int py = y0 + row * scale + sy;
+
+					if (py >= height)
+						continue;
+					for (sx = 0; sx < scale; sx++) {
+						unsigned int px = gx + col * scale + sx;
+
+						if (px + 2 < width && py + 2 < height) {
+							u32 *sp = (u32 *)(fb + (py + 2) * pitch) + (px + 2);
+							*sp = 0xff050811U;
+						}
+						if (px < width) {
+							u32 *dp = (u32 *)(fb + py * pitch) + px;
+							*dp = color;
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+/*
+ * Render kernel boot confirmation banner below the top-center waterdrop camera
+ * cutout (118x81 px at x=481..599, y=0..81 on 1080x2312 marie panel).
+ */
+static void marie_draw_unlock_banner(void *screen_base, unsigned int width,
+				     unsigned int height, unsigned int pitch)
+{
+	const char *line1 = "Kirin 710 Kernel " UTS_RELEASE;
+	const char *line2 = "Copyright apkreader 2026";
+	const struct font_desc *font;
+	unsigned int max_len, card_w, card_h, bx0, bx1, by0, by1, y, x;
+	const unsigned int radius = 22;
+	u8 *fb = (u8 *)screen_base;
+
+	if (!fb || width < 720 || height < 400)
+		return;
+
+	font = find_font("VGA8x16");
+	if (!font || !font->data)
+		return;
+
+	max_len = max(strlen(line1), strlen(line2));
+	card_w = min(width - 64U, (unsigned int)(max_len * 18U + 72U));
+	card_h = 114U;
+	bx0 = (width - card_w) / 2U;
+	bx1 = bx0 + card_w;
+	by0 = 110U; /* 29 px clear below the 81 px waterdrop camera notch */
+	by1 = by0 + card_h;
+
+	for (y = by0; y < by1 && y < height; y++) {
+		u32 *rowp = (u32 *)(fb + y * pitch);
+		int dy = 0;
+
+		if (y < by0 + radius)
+			dy = (int)(by0 + radius) - (int)y;
+		else if (y >= by1 - radius)
+			dy = (int)y - (int)(by1 - radius - 1);
+
+		for (x = bx0; x < bx1 && x < width; x++) {
+			int dx = 0;
+			int d2;
+
+			if (x < bx0 + radius)
+				dx = (int)(bx0 + radius) - (int)x;
+			else if (x >= bx1 - radius)
+				dx = (int)x - (int)(bx1 - radius - 1);
+
+			d2 = dx * dx + dy * dy;
+			if ((dx || dy) && d2 > (int)(radius * radius))
+				continue;
+
+			if (((dx || dy) && d2 >= (int)((radius - 2) * (radius - 2))) ||
+			    (!dx && !dy && (y < by0 + 2 || y >= by1 - 2 || x < bx0 + 2 || x >= bx1 - 2))) {
+				rowp[x] = marie_lerp_rgb(0x0038bdf8U, 0x00a78bfaU, x - bx0, card_w);
+			} else {
+				u32 old = rowp[x];
+				u32 r = (((old >> 16) & 0xff) + 15U * 7U) >> 3;
+				u32 g = (((old >> 8) & 0xff) + 23U * 7U) >> 3;
+				u32 b = ((old & 0xff) + 42U * 7U) >> 3;
+
+				rowp[x] = 0xff000000U | (r << 16) | (g << 8) | b;
+			}
+		}
+	}
+
+	marie_draw_banner_line(fb, width, height, pitch, font, line1,
+			       by0 + 18U, 0x0038bdf8U, 0x0034d399U);
+	marie_draw_banner_line(fb, width, height, pitch, font, line2,
+			       by0 + 64U, 0x00fbbf24U, 0x00fb923cU);
+
+	if (marie_fb_is_wc) {
+		dsb(st);
+	} else {
+		unsigned long s0 = (unsigned long)fb + (unsigned long)by0 * pitch;
+		unsigned long s1 = (unsigned long)fb + (unsigned long)min(height, by1 + 4U) * pitch;
+
+		dcache_clean_poc(s0, s1);
+	}
 }
 
 static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
@@ -1398,6 +1616,10 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 			return screen_base;
 
 		iosys_map_set_vaddr(&sdev->screen_base, screen_base);
+#ifdef CONFIG_ARM64
+		if (!marie_is_charger_mode() && format->format == DRM_FORMAT_XRGB8888)
+			marie_draw_unlock_banner(screen_base, width, height, stride);
+#endif
 	} else {
 		void __iomem *screen_base;
 
@@ -1454,10 +1676,11 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 
 	nformats = drm_fb_build_fourcc_list(dev, &format->format, 1,
 					    sdev->formats, ARRAY_SIZE(sdev->formats));
-	if (format->format == DRM_FORMAT_XRGB8888 && nformats + 3 <= ARRAY_SIZE(sdev->formats)) {
+	if (format->format == DRM_FORMAT_XRGB8888 && nformats + 4 <= ARRAY_SIZE(sdev->formats)) {
 		sdev->formats[nformats++] = DRM_FORMAT_ARGB8888;
 		sdev->formats[nformats++] = DRM_FORMAT_XBGR8888;
 		sdev->formats[nformats++] = DRM_FORMAT_ABGR8888;
+		sdev->formats[nformats++] = DRM_FORMAT_RGB565;
 	}
 
 	primary_plane = &sdev->primary_plane;
@@ -1582,7 +1805,12 @@ static int simpledrm_probe(struct platform_device *pdev)
 	if (color_mode == 16)
 		color_mode = sdev->format->depth; // can be 15 or 16
 
+#ifdef CONFIG_ARM64
+	if (marie_is_charger_mode())
+		drm_fbdev_shmem_setup(dev, color_mode);
+#else
 	drm_fbdev_shmem_setup(dev, color_mode);
+#endif
 
 	return 0;
 }
