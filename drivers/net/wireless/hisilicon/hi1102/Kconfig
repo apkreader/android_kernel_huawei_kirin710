@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config HI1102_WIFI
+	tristate "HiSilicon Hi1102 SDIO Wi-Fi driver (Kirin 710)"
+	depends on MMC && CFG80211
+	help
+	  Wi-Fi driver for HiSilicon Hi1102 SDIO connectivity chipships on
+	  Kirin 710 platforms (e.g. Huawei P30 lite) with modern cfg80211
+	  WPA3-SAE and 802.11w PMF support.

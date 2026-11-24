@@ -7,6 +7,7 @@
 #include <linux/bitops.h>
 #include <linux/bitfield.h>
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/mfd/syscon.h>
 #include <linux/mmc/host.h>
 #include <linux/module.h>
@@ -441,7 +442,140 @@ static const struct dw_mci_drv_data hi3660_data = {
 	.switch_voltage  = dw_mci_hi3660_switch_voltage,
 };
 
+
+#define LIBRA_PERI_CRG_RSTEN4	0x90
+#define LIBRA_PERI_CRG_RSTDIS4	0x94
+#define LIBRA_BIT_RST_SDIO	BIT(20)
+
+static struct dw_mci *kirin710_sdio_host;
+static bool kirin710_sdio_card_present;
+
+void kirin710_sdio_set_card_present(bool present)
+{
+	kirin710_sdio_card_present = present;
+	if (kirin710_sdio_host && kirin710_sdio_host->slot &&
+	    kirin710_sdio_host->slot->mmc) {
+		struct mmc_host *mmc = kirin710_sdio_host->slot->mmc;
+
+		dev_info(kirin710_sdio_host->dev,
+			 "kirin710 sdio card_present=%d -> mmc_detect_change\n",
+			 present);
+		if (present)
+			mmc->rescan_entered = 0;
+		mmc_detect_change(mmc, 0);
+	}
+}
+EXPORT_SYMBOL_GPL(kirin710_sdio_set_card_present);
+
+static int dw_mci_libra_parse_dt(struct dw_mci *host)
+{
+	struct k3_priv *priv;
+
+	priv = devm_kzalloc(host->dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	if (of_property_read_bool(host->dev->of_node, "caps2-support-wifi"))
+		priv->ctrl_id = DWMMC_SDIO_ID;
+	else {
+		priv->ctrl_id = of_alias_get_id(host->dev->of_node, "mshc");
+		if (priv->ctrl_id < 0)
+			priv->ctrl_id = 0;
+	}
+
+	if (priv->ctrl_id >= TIMING_MODE)
+		return -EINVAL;
+
+	host->priv = priv;
+	return 0;
+}
+
+static int dw_mci_libra_init(struct dw_mci *host)
+{
+	struct k3_priv *priv = host->priv;
+	struct device_node *crg_np;
+	struct resource res;
+	void __iomem *crg;
+	int ret;
+
+	/* Only bring up the Wi-Fi SDIO controller (dwmmc2@FC183000) for now. */
+	if (priv->ctrl_id != DWMMC_SDIO_ID)
+		return -ENODEV;
+
+	/* Reset and release SDIO controller in PERI_CRG */
+	crg_np = of_find_compatible_node(NULL, NULL, "hisilicon,clk-crgctrl");
+	if (crg_np) {
+		if (!of_address_to_resource(crg_np, 0, &res)) {
+			crg = ioremap(res.start, resource_size(&res));
+			if (crg) {
+				writel(LIBRA_BIT_RST_SDIO, crg + LIBRA_PERI_CRG_RSTEN4);
+				udelay(20);
+				writel(LIBRA_BIT_RST_SDIO, crg + LIBRA_PERI_CRG_RSTDIS4);
+				udelay(20);
+				iounmap(crg);
+			}
+		}
+		of_node_put(crg_np);
+	}
+
+	/* Set initial legacy 400kHz bus clock (3.2 MHz / 8) */
+	ret = clk_set_rate(host->ciu_clk, 3200000);
+	if (ret)
+		dev_warn(host->dev, "libra sdio clk_set_rate(3.2M) failed: %d\n", ret);
+
+	host->bus_hz = clk_get_rate(host->ciu_clk);
+	if (!host->bus_hz)
+		host->bus_hz = 3200000;
+
+	dw_mci_hs_set_timing(host, MMC_TIMING_LEGACY, -1);
+	host->bus_hz /= (GENCLK_DIV + 1);
+
+	kirin710_sdio_host = host;
+	dev_info(host->dev, "Kirin 710 SDIO controller initialized (bus_hz=%u)\n",
+		 host->bus_hz);
+	return 0;
+}
+
+static void dw_mci_libra_set_ios(struct dw_mci *host, struct mmc_ios *ios)
+{
+	struct k3_priv *priv = host->priv;
+	unsigned long wanted, actual;
+	int ret;
+
+	if (!ios->clock || ios->clock == priv->cur_speed)
+		return;
+
+	/* Cap to 50 MHz High-Speed for initial bring-up (avoids 1.8V UHS tuning). */
+	wanted = min_t(unsigned long, ios->clock, 50000000UL) * (GENCLK_DIV + 1);
+	ret = clk_set_rate(host->ciu_clk, wanted);
+	if (ret) {
+		dev_warn(host->dev, "libra failed to set ciu rate %luHz: %d\n",
+			 wanted, ret);
+		return;
+	}
+	actual = clk_get_rate(host->ciu_clk);
+	dw_mci_hs_set_timing(host, ios->timing, -1);
+	host->bus_hz = actual / (GENCLK_DIV + 1);
+	host->current_speed = 0;
+	priv->cur_speed = ios->clock;
+}
+
+static unsigned long dw_mci_libra_caps[] = {
+	0,
+	0,
+	MMC_CAP_4_BIT_DATA | MMC_CAP_SD_HIGHSPEED | MMC_CAP_NONREMOVABLE | MMC_CAP_SDIO_IRQ,
+};
+
+static const struct dw_mci_drv_data libra_data = {
+	.caps = dw_mci_libra_caps,
+	.num_caps = ARRAY_SIZE(dw_mci_libra_caps),
+	.init = dw_mci_libra_init,
+	.set_ios = dw_mci_libra_set_ios,
+	.parse_dt = dw_mci_libra_parse_dt,
+};
+
 static const struct of_device_id dw_mci_k3_match[] = {
+	{ .compatible = "hisilicon,libra-dw-mshc", .data = &libra_data, },
 	{ .compatible = "hisilicon,hi3660-dw-mshc", .data = &hi3660_data, },
 	{ .compatible = "hisilicon,hi4511-dw-mshc", .data = &k3_drv_data, },
 	{ .compatible = "hisilicon,hi6220-dw-mshc", .data = &hi6220_data, },

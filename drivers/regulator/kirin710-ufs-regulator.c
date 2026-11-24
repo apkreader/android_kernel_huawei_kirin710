@@ -197,6 +197,113 @@ put_node:
 	return ret;
 }
 
+
+struct kirin710_pmu_gate {
+	struct clk_hw hw;
+	struct spmi_device *sdev;
+	u16 reg;
+	u8 mask;
+};
+
+static int kirin710_pmu_gate_prepare(struct clk_hw *hw)
+{
+	struct kirin710_pmu_gate *g = container_of(hw, struct kirin710_pmu_gate, hw);
+	u8 val;
+	int ret;
+
+	ret = spmi_ext_register_readl(g->sdev, g->reg, &val, 1);
+	if (ret)
+		return ret;
+	val |= g->mask;
+	return spmi_ext_register_writel(g->sdev, g->reg, &val, 1);
+}
+
+static void kirin710_pmu_gate_unprepare(struct clk_hw *hw)
+{
+	struct kirin710_pmu_gate *g = container_of(hw, struct kirin710_pmu_gate, hw);
+	u8 val;
+
+	if (!spmi_ext_register_readl(g->sdev, g->reg, &val, 1)) {
+		val &= ~g->mask;
+		spmi_ext_register_writel(g->sdev, g->reg, &val, 1);
+	}
+}
+
+static int kirin710_pmu_gate_is_prepared(struct clk_hw *hw)
+{
+	struct kirin710_pmu_gate *g = container_of(hw, struct kirin710_pmu_gate, hw);
+	u8 val = 0;
+
+	if (spmi_ext_register_readl(g->sdev, g->reg, &val, 1))
+		return 0;
+	return !!(val & g->mask);
+}
+
+static const struct clk_ops kirin710_pmu_gate_ops = {
+	.prepare = kirin710_pmu_gate_prepare,
+	.unprepare = kirin710_pmu_gate_unprepare,
+	.is_prepared = kirin710_pmu_gate_is_prepared,
+};
+
+static int kirin710_register_pmu32kb(struct spmi_device *sdev)
+{
+	struct device *dev = &sdev->dev;
+	struct clk_init_data init = {
+		.name = "clk_pmu32kb",
+		.ops = &kirin710_pmu_gate_ops,
+	};
+	struct device_node *node;
+	struct kirin710_pmu_gate *g;
+	const char *parent;
+	u32 gate[2];
+	int ret;
+
+	for_each_compatible_node(node, NULL, "hisilicon,clk-pmu-gate") {
+		const char *name = NULL;
+
+		if (!of_property_read_string(node, "clock-output-names", &name) &&
+		    !strcmp(name, "clk_pmu32kb"))
+			break;
+	}
+	if (!node)
+		return -ENOENT;
+
+	if (of_property_read_u32_array(node, "hisilicon,clkgate", gate, 2) ||
+	    gate[0] > 0xffff || gate[1] >= 8) {
+		of_node_put(node);
+		return -EINVAL;
+	}
+
+	parent = of_clk_get_parent_name(node, 0);
+	if (parent) {
+		init.parent_names = &parent;
+		init.num_parents = 1;
+	}
+
+	g = devm_kzalloc(dev, sizeof(*g), GFP_KERNEL);
+	if (!g) {
+		of_node_put(node);
+		return -ENOMEM;
+	}
+
+	g->sdev = sdev;
+	g->reg = gate[0];
+	g->mask = BIT(gate[1]);
+	g->hw.init = &init;
+
+	ret = devm_clk_hw_register(dev, &g->hw);
+	if (ret) {
+		of_node_put(node);
+		return ret;
+	}
+	ret = of_clk_add_hw_provider(node, of_clk_hw_simple_get, &g->hw);
+	if (ret) {
+		of_node_put(node);
+		return ret;
+	}
+	return devm_add_action_or_reset(dev, kirin710_abb_remove_provider, node);
+}
+
 static struct spmi_device *kirin710_pmic_sdev;
 
 struct spmi_device *kirin710_pmic_get_sdev(void)
@@ -286,6 +393,9 @@ static int kirin710_ufs_regulator_probe(struct spmi_device *sdev)
 
 		if (clk_ret)
 			dev_warn(dev, "failed to register ABB clock: %d\n", clk_ret);
+		clk_ret = kirin710_register_pmu32kb(sdev);
+		if (clk_ret && clk_ret != -ENOENT)
+			dev_warn(dev, "failed to register clk_pmu32kb: %d\n", clk_ret);
 	}
 
 put_node:

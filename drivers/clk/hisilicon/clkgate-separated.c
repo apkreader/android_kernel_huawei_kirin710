@@ -299,7 +299,9 @@ static void __init kirin710_gate_setup(struct device_node *np)
 		parent_compatible = "hisilicon,clk-sctrl";
 	else if (!strcmp(name, "clk_usb2otg_ref") || !strcmp(name, "clk_usb2otg") ||
 		 !strcmp(name, "hclk_usb2otgfreq") || !strcmp(name, "pclk_wd0") ||
-		 !strcmp(name, "pclk_wd0_high"))
+		 !strcmp(name, "pclk_wd0_high") || !strcmp(name, "clk_sdio") ||
+		 !strcmp(name, "hclk_sdio") ||
+		 !strcmp(name, "peri_volt_hold"))
 		parent_compatible = "hisilicon,clk-crgctrl";
 	else
 		return;
@@ -309,7 +311,8 @@ static void __init kirin710_gate_setup(struct device_node *np)
 	    of_property_read_u32_array(np, "hisilicon,hi3xxx-clkgate", gate, 2) ||
 	    (gate[1] & (gate[1] - 1)) ||
 	    ((gate[1] == 0) != (!strcmp(name, "hclk_usb2otgfreq") ||
-			 !strcmp(name, "pclk_wd0"))) || (gate[0] & 3))
+			 !strcmp(name, "pclk_wd0") ||
+			 !strcmp(name, "peri_volt_hold"))) || (gate[0] & 3))
 		return;
 
 	parent = of_get_parent(np);
@@ -386,11 +389,23 @@ static void __init kirin710_mux_setup(struct device_node *np)
 	    of_property_read_u32_array(np, "hisilicon,clkmux-reg", mux, 2))
 		return;
 
+	unsigned long clk_flags = 0;
+
 	if (!strcmp(name, "clk_wd0_mux") && mux[1] == BIT(17)) {
 		flags = CLK_MUX_READ_ONLY;
 	} else if (!strcmp(name, "clk_sec_pll_mux") && mux[1] == BIT(5) &&
 		   of_property_read_bool(np, "hiword")) {
 		flags = CLK_MUX_HIWORD_MASK;
+	} else if (!strcmp(name, "clk_sdio_muxsy") && mux[1] == BIT(6) &&
+		   of_property_read_bool(np, "hiword")) {
+		flags = CLK_MUX_HIWORD_MASK;
+		clk_flags = CLK_SET_RATE_PARENT;
+	} else if (!strcmp(name, "clk_sdio_muxpl") && mux[1] == GENMASK(5, 4) &&
+		   of_property_read_bool(np, "hiword")) {
+		parents[0] = of_clk_get_parent_name(np, 0);
+		if (parents[0])
+			kirin710_register_passthrough(np, name, parents[0]);
+		return;
 	} else {
 		return;
 	}
@@ -404,7 +419,7 @@ static void __init kirin710_mux_setup(struct device_node *np)
 	if (!reg)
 		return;
 
-	hw = clk_hw_register_mux(NULL, name, parents, ARRAY_SIZE(parents), 0,
+	hw = clk_hw_register_mux(NULL, name, parents, ARRAY_SIZE(parents), clk_flags,
 				 reg, __ffs(mux[1]), 1, flags, NULL);
 	if (!IS_ERR(hw)) {
 		ret = of_clk_add_hw_provider(np, of_clk_hw_simple_get, hw);
@@ -436,6 +451,9 @@ static void __init kirin710_div_setup(struct device_node *np)
 		flags = CLK_DIVIDER_READ_ONLY;
 	} else if (!strcmp(name, "clk_sec_div") && div[1] == GENMASK(4, 0) &&
 		   range[0] == 32 && of_property_read_bool(np, "hiword")) {
+		flags = CLK_DIVIDER_HIWORD_MASK;
+	} else if (!strcmp(name, "clk_sdio_div") && div[1] == GENMASK(3, 0) &&
+		   range[0] == 16 && of_property_read_bool(np, "hiword")) {
 		flags = CLK_DIVIDER_HIWORD_MASK;
 	} else {
 		return;
@@ -480,7 +498,8 @@ static void __init kirin710_hiword_gate_setup(struct device_node *np)
 
 	if (!strcmp(name, "clk_usb_tcxo_en"))
 		parent_compatible = "hisilicon,clk-pctrl";
-	else if (!strcmp(name, "autodiv_sysbus") || !strcmp(name, "clk_gt_sec"))
+	else if (!strcmp(name, "autodiv_sysbus") || !strcmp(name, "clk_gt_sec") ||
+		 !strcmp(name, "clk_sdio_gt") || !strcmp(name, "clk_sdio_sys_gt"))
 		parent_compatible = "hisilicon,clk-crgctrl";
 	else
 		return;
