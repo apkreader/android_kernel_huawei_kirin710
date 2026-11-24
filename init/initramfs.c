@@ -705,27 +705,26 @@ static void __init populate_initrd_image(char *err)
 
 static void __init do_populate_rootfs(void *unused, async_cookie_t cookie)
 {
+	char *err;
+
+	if (initrd_start && initrd_end > initrd_start && !IS_ENABLED(CONFIG_INITRAMFS_FORCE)) {
+		pr_info("MARIE_INITRD: unpacking external initrd %#lx..%#lx (%lu bytes), skipping embedded initramfs\n",
+			initrd_start, initrd_end, initrd_end - initrd_start);
+		err = unpack_to_rootfs((char *)initrd_start, initrd_end - initrd_start);
+		if (err) {
+#ifdef CONFIG_BLK_DEV_RAM
+			populate_initrd_image(err);
+#else
+			printk(KERN_EMERG "Initramfs unpacking failed: %s\n", err);
+#endif
+		}
+		goto done;
+	}
+
 	/* Load the built in initramfs */
-	char *err = unpack_to_rootfs(__initramfs_start, __initramfs_size);
+	err = unpack_to_rootfs(__initramfs_start, __initramfs_size);
 	if (err)
 		panic_show_mem("%s", err); /* Failed to decompress INTERNAL initramfs */
-
-	if (!initrd_start || IS_ENABLED(CONFIG_INITRAMFS_FORCE))
-		goto done;
-
-	if (IS_ENABLED(CONFIG_BLK_DEV_RAM))
-		printk(KERN_INFO "Trying to unpack rootfs image as initramfs...\n");
-	else
-		printk(KERN_INFO "Unpacking initramfs...\n");
-
-	err = unpack_to_rootfs((char *)initrd_start, initrd_end - initrd_start);
-	if (err) {
-#ifdef CONFIG_BLK_DEV_RAM
-		populate_initrd_image(err);
-#else
-		printk(KERN_EMERG "Initramfs unpacking failed: %s\n", err);
-#endif
-	}
 
 done:
 	security_initramfs_populated();
