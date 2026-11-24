@@ -29,6 +29,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
@@ -1455,11 +1456,13 @@ static struct i2c_driver marie_lm36274_driver = {
 #define HI6523_REG_STATUS0		0x06
 #define HI6523_REG_STATUS1		0x07
 #define HI6523_REG_BUCK_REG0		0x60	/* bits [6:2] buck_ilimit */
+#define HI6523_REG_BUCK_REG2		0x62	/* bits [4:2] buck_dpm_sel (VINDPM) */
 #define HI6523_REG_CHG_REG0		0x90	/* bit 5 chg_en, bit 4 batfet_ctrl */
 #define HI6523_REG_CHG_REG1		0x91	/* bits [4:0] chg_fast_ichg */
 #define HI6523_REG_CHG_REG2		0x92	/* bits [6:3] chg_fast_vchg, [2:0] term_ichg */
 #define HI6523_REG_CHG_REG3		0x93	/* bits [1:0] fastchg_timer */
 #define HI6523_REG_CHG_REG4		0x94	/* bit 2 chg_en_term */
+#define HI6523_REG_DET_TOP_REG0		0xa0	/* bits [1:0] vbus_vset (0=5V) */
 #define HI6523_REG_SCHG_LOGIC_CTRL	0xa3	/* bit 0 buck_enb (HIZ) */
 #define HI6523_REG_WDT_SOFT_RST		0xe8	/* bit 0 wd_rst_n */
 #define HI6523_REG_WDT_CTRL		0xe9	/* bits [1:0] watchdog_timer */
@@ -1467,9 +1470,9 @@ static struct i2c_driver marie_lm36274_driver = {
 #define HI6523_ILIMIT_900MA		3	/* 900 mA (PC USB with HW VINDPM) */
 #define HI6523_ILIMIT_2000MA		14	/* 2000 mA (AC / USB-C wall charger) */
 #define HI6523_ICHG_1000MA		9	/* 1000 mA */
-#define HI6523_ICHG_2000MA		14	/* 2000 mA */
+#define HI6523_ICHG_2200MA		16	/* 2200 mA (full 5V/2A buck output) */
 #define HI6523_VCHG_4400MV		12	/* (4400 - 3800) / 50 = 12 */
-#define HI6523_ITERM_150MA		2	/* 150 mA termination */
+#define HI6523_ITERM_150MA		2	/* 150 mA termination (full 100% top-off) */
 
 static DEFINE_MUTEX(marie_hi6523_lock);
 static struct i2c_client *marie_hi6523_client;
@@ -1522,12 +1525,14 @@ static void marie_hi6523_update(bool vbus_online, bool pc_usb)
 		return;
 	}
 
-	/* Always ensure WDT is disabled and kicked, HIZ off, 4.40V VREG, charging enabled */
+	/* Always ensure WDT is disabled and kicked, HIZ off, 5V VBUS / 85% VINDPM, 4.40V VREG */
 	ilim = pc_usb ? HI6523_ILIMIT_900MA : HI6523_ILIMIT_2000MA;
-	ichg = pc_usb ? HI6523_ICHG_1000MA : HI6523_ICHG_2000MA;
+	ichg = pc_usb ? HI6523_ICHG_1000MA : HI6523_ICHG_2200MA;
 
 	hi6523_write_mask(client, HI6523_REG_WDT_CTRL, 0x03, 0, 0x00);
 	hi6523_write_mask(client, HI6523_REG_WDT_SOFT_RST, BIT(0), 0, 1);
+	hi6523_write_mask(client, HI6523_REG_DET_TOP_REG0, 0x03, 0, 0x00); /* 5V VBUS */
+	hi6523_write_mask(client, HI6523_REG_BUCK_REG2, 0x07 << 2, 2, 1);  /* 85% VINDPM (4.25V) */
 	hi6523_write_mask(client, HI6523_REG_SCHG_LOGIC_CTRL, BIT(0), 0, 0);
 	hi6523_write_mask(client, HI6523_REG_BUCK_REG0, 0x1f << 2, 2, ilim);
 	hi6523_write_mask(client, HI6523_REG_CHG_REG1, 0x1f, 0, ichg);
@@ -1539,17 +1544,21 @@ static void marie_hi6523_update(bool vbus_online, bool pc_usb)
 	hi6523_write_mask(client, HI6523_REG_CHG_REG0, BIT(5), 5, 1);	/* enable charging */
 
 	if (mode != marie_hi6523_last_mode) {
+		int r62;
+
 		marie_hi6523_last_mode = mode;
 		st0 = i2c_smbus_read_byte_data(client, HI6523_REG_STATUS0);
 		st1 = i2c_smbus_read_byte_data(client, HI6523_REG_STATUS1);
 		r60 = i2c_smbus_read_byte_data(client, HI6523_REG_BUCK_REG0);
+		r62 = i2c_smbus_read_byte_data(client, HI6523_REG_BUCK_REG2);
 		r90 = i2c_smbus_read_byte_data(client, HI6523_REG_CHG_REG0);
 		r91 = i2c_smbus_read_byte_data(client, HI6523_REG_CHG_REG1);
 		r92 = i2c_smbus_read_byte_data(client, HI6523_REG_CHG_REG2);
-		pr_info("MARIE_CHG: HI6523 configured mode=%s (IIN=%dmA ICHG=%dmA VREG=4400mV) st0=0x%02x st1=0x%02x r60=0x%02x r90=0x%02x r91=0x%02x r92=0x%02x\n",
+		pr_info("MARIE_CHG: HI6523 configured mode=%s (IIN=%dmA ICHG=%dmA VREG=4400mV) st0=0x%02x st1=0x%02x r60=0x%02x r62=0x%02x r90=0x%02x r91=0x%02x r92=0x%02x\n",
 			pc_usb ? "USB" : "AC",
-			pc_usb ? 900 : 2000, pc_usb ? 1000 : 2000,
-			st0 & 0xff, st1 & 0xff, r60 & 0xff, r90 & 0xff, r91 & 0xff, r92 & 0xff);
+			pc_usb ? 900 : 2000, pc_usb ? 1000 : 2200,
+			st0 & 0xff, st1 & 0xff, r60 & 0xff, r62 & 0xff,
+			r90 & 0xff, r91 & 0xff, r92 & 0xff);
 	}
 	mutex_unlock(&marie_hi6523_lock);
 }
@@ -1641,27 +1650,116 @@ static const struct marie_ocv_pt marie_ocv_table[] = {
 	{ 3200,   0 },
 };
 
+/* Matches Huawei Kirin 710 stock struct ss_coul_nv_info (HICOUL NV #316) */
+struct marie_coul_nv_info {
+	s32 charge_cycles;	/* centi-cycles (cycles * 100) */
+	s32 v_offset_a;		/* voltage gain (nominal 1000000) */
+	s32 v_offset_b;		/* voltage offset in uV */
+	s32 c_offset_a;		/* current gain (nominal 1000000) */
+	s32 c_offset_b;		/* current offset in uA */
+	s32 limit_fcc;		/* learned FCC limit in uAh */
+	s16 temp[10];
+	s16 real_fcc[10];
+	s16 calc_ocv_reg_v;
+	s16 calc_ocv_reg_c;
+	s16 hkadc_batt_id_voltage;
+	s16 real_fcc_record[5];
+	s16 latest_record_index;
+	s16 basp_delay_config;
+	s32 fcc_check_sum_ext;
+	s16 change_battery_learn_flag;
+	s16 qmax;
+	s32 report_full_fcc_real;
+};
+
+static unsigned long marie_pmu_nv_addr;
+
+static int __init marie_parse_pmu_nv_addr(char *p)
+{
+	if (!p || kstrtoul(p, 16, &marie_pmu_nv_addr))
+		marie_pmu_nv_addr = 0;
+	return 0;
+}
+early_param("pmu_nv_addr", marie_parse_pmu_nv_addr);
+
 struct marie_battery {
 	struct spmi_device *sdev;
 	struct power_supply *bat_psy;
 	struct power_supply *usb_psy;
+	struct power_supply *ac_psy;
 	struct delayed_work poll_work;
 	struct mutex lock;
 	int vbat_uv;
 	int i_out_ua;	/* >0 discharging, <0 charging (HI6555v200 convention) */
 	int ocv_uv;
 	s64 rem_uah;	/* Coulomb-counted remaining charge in uAh */
+	s64 fcc_uah;	/* Learned/rated full charge capacity in uAh */
+	s64 charged_acc_uah;	/* Runtime accumulated charge for cycle tracking */
+	int cycle_count;
+	int v_offset_a;
+	int v_offset_b;
+	int c_offset_a;
+	int c_offset_b;
 	u32 cl_out_prev;
 	u32 cl_in_prev;
 	int cap;
 	int status;
 	bool usb_online;
+	bool pc_usb;
 	bool ready;
 	unsigned int poll_ticks;
 	ktime_t last_sample_kt;
 };
 
 static struct marie_battery marie_bat;
+
+static void marie_bat_load_hicoul_nv(struct marie_battery *mb)
+{
+	void __iomem *nv_io;
+	struct marie_coul_nv_info nv;
+
+	mb->fcc_uah = MARIE_BAT_FCC_UAH;
+	mb->cycle_count = 0;
+	mb->v_offset_a = 1000000;
+	mb->v_offset_b = 0;
+	mb->c_offset_a = 1000000;
+	mb->c_offset_b = 0;
+
+	if (!marie_pmu_nv_addr)
+		return;
+
+	nv_io = ioremap_wc(marie_pmu_nv_addr, sizeof(nv));
+	if (!nv_io) {
+		pr_warn("MARIE_BAT: ioremap_wc(pmu_nv_addr=0x%lx) failed\n",
+			marie_pmu_nv_addr);
+		return;
+	}
+	memcpy_fromio(&nv, nv_io, sizeof(nv));
+	iounmap(nv_io);
+
+	if (nv.v_offset_a >= 900000 && nv.v_offset_a <= 1100000)
+		mb->v_offset_a = nv.v_offset_a;
+	if (nv.v_offset_b >= -100000 && nv.v_offset_b <= 100000)
+		mb->v_offset_b = nv.v_offset_b;
+	if (nv.c_offset_a >= 900000 && nv.c_offset_a <= 1100000)
+		mb->c_offset_a = nv.c_offset_a;
+	if (nv.c_offset_b >= -100000 && nv.c_offset_b <= 100000)
+		mb->c_offset_b = nv.c_offset_b;
+
+	if (nv.report_full_fcc_real >= 1500000 && nv.report_full_fcc_real <= 3600000)
+		mb->fcc_uah = nv.report_full_fcc_real;
+	else if (nv.limit_fcc >= 1500000 && nv.limit_fcc <= 3600000)
+		mb->fcc_uah = nv.limit_fcc;
+
+	if (nv.charge_cycles >= 0 && nv.charge_cycles < 1000000)
+		mb->cycle_count = nv.charge_cycles / 100;
+
+	pr_info("MARIE_BAT: HICOUL nv@0x%lx cycles=%d (%d.%02d) fcc=%lld uAh (limit=%d full=%d qmax=%d) v_off=(%d,%d) c_off=(%d,%d)\n",
+		marie_pmu_nv_addr, mb->cycle_count,
+		nv.charge_cycles / 100, abs(nv.charge_cycles % 100),
+		mb->fcc_uah, nv.limit_fcc, nv.report_full_fcc_real, nv.qmax,
+		mb->v_offset_a, mb->v_offset_b, mb->c_offset_a, mb->c_offset_b);
+}
 
 static int marie_bat_read_u32(struct spmi_device *sdev, u16 reg, u32 *out)
 {
@@ -1693,6 +1791,8 @@ static int marie_bat_read_uv(struct spmi_device *sdev)
 	/* HI6555v200: 15-bit little-endian ADC, 1 LSB = 2400000 / 10661 uV */
 	raw = (s16)(((u16)hi << 8) | lo) & 0x7fff;
 	uv = div_s64((s64)raw * 2400000LL, 10661);
+	if (marie_bat.v_offset_a)
+		uv = div_s64(uv * marie_bat.v_offset_a, 1000000LL) + marie_bat.v_offset_b;
 	if (uv < 2800000 || uv > 4600000)
 		return 3850000;
 	return (int)uv;
@@ -1717,6 +1817,8 @@ static int marie_bat_read_iout_ua(struct spmi_device *sdev)
 	 */
 	raw = (s16)(((u16)hi << 8) | lo);
 	ua = div_s64((s64)raw * 5000000LL, 10661);
+	if (marie_bat.c_offset_a)
+		ua = div_s64(ua * marie_bat.c_offset_a, 1000000LL) + marie_bat.c_offset_b;
 	if (ua < -6000000 || ua > 6000000)
 		return 0;
 	return (int)ua;
@@ -1779,24 +1881,26 @@ static void marie_bat_save_soc(struct spmi_device *sdev, int cap)
 		spmi_ext_register_writel(sdev, PMIC_HRST_REG6_REG, &val, 1);
 }
 
-static int marie_bat_calc_status(bool usb, int cap, int vbat_uv, int i_out_ua)
+static int marie_bat_calc_status(bool usb_online, int cap, int vbat_uv, int i_out_ua)
 {
-	if (!usb)
+	if (!usb_online)
 		return POWER_SUPPLY_STATUS_DISCHARGING;
-	if (marie_hi6523_is_charge_done() ||
-	    (cap >= 100 && (vbat_uv >= 4340000 || i_out_ua > -150000)))
+	if (cap >= 100 ||
+	    (cap >= 99 && (marie_hi6523_is_charge_done() ||
+			   (vbat_uv >= 4375000 && i_out_ua > -200000))))
 		return POWER_SUPPLY_STATUS_FULL;
 	return POWER_SUPPLY_STATUS_CHARGING;
 }
 
 static void marie_bat_update_cap_from_rem(struct marie_battery *mb)
 {
-	const s64 one_pct = MARIE_BAT_FCC_UAH / 100;
-	const s64 hyst = MARIE_BAT_FCC_UAH / 300;	/* ~0.33% deadband (~11 mAh) */
+	const s64 fcc = mb->fcc_uah > 0 ? mb->fcc_uah : MARIE_BAT_FCC_UAH;
+	const s64 one_pct = div_s64(fcc, 100);
+	const s64 hyst = div_s64(fcc, 300);	/* ~0.33% deadband (~11 mAh) */
 
-	mb->rem_uah = clamp_t(s64, mb->rem_uah, 0, MARIE_BAT_FCC_UAH);
+	mb->rem_uah = clamp_t(s64, mb->rem_uah, 0, fcc);
 
-	if (mb->rem_uah >= MARIE_BAT_FCC_UAH) {
+	if (mb->rem_uah >= fcc) {
 		mb->cap = 100;
 		return;
 	}
@@ -1841,16 +1945,20 @@ static void marie_bat_sample_locked(struct marie_battery *mb, bool init)
 		    (hrst6 & 0x80)) {
 			int saved_cap = hrst6 & 0x7f;
 
-			if (saved_cap <= 100 && abs(saved_cap - ocv_cap) <= 4)
+			if (saved_cap <= 100 && abs(saved_cap - ocv_cap) <= 15)
 				init_cap = saved_cap;
 		}
 
 		mb->cap = init_cap;
 		/* Center inside the percentage bucket */
-		mb->rem_uah = clamp_t(s64,
-				      (s64)init_cap * (MARIE_BAT_FCC_UAH / 100) +
-				      (MARIE_BAT_FCC_UAH / 200),
-				      0, MARIE_BAT_FCC_UAH);
+		{
+			s64 fcc = mb->fcc_uah > 0 ? mb->fcc_uah : MARIE_BAT_FCC_UAH;
+
+			mb->rem_uah = clamp_t(s64,
+					      div_s64((s64)init_cap * fcc, 100) +
+					      div_s64(fcc, 200),
+					      0, fcc);
+		}
 		marie_bat_read_u32(mb->sdev, PMIC_CL_OUT0_REG, &mb->cl_out_prev);
 		marie_bat_read_u32(mb->sdev, PMIC_CL_IN0_REG, &mb->cl_in_prev);
 		mb->last_sample_kt = now_kt;
@@ -1892,18 +2000,30 @@ static void marie_bat_sample_locked(struct marie_battery *mb, bool init)
 			delta_uah = div_s64((s64)(-i_out_ua) * dt_ms, 3600000LL);
 
 		mb->rem_uah += delta_uah;
+		if (delta_uah > 0) {
+			s64 fcc = mb->fcc_uah > 0 ? mb->fcc_uah : MARIE_BAT_FCC_UAH;
+
+			mb->charged_acc_uah += delta_uah;
+			while (mb->charged_acc_uah >= fcc) {
+				mb->charged_acc_uah -= fcc;
+				mb->cycle_count++;
+			}
+		}
 
 		/* End-of-charge (HI6523 CHG_DONE or CV taper near 4.40V) -> finish to 100% */
-		if (mb->usb_online && (marie_hi6523_is_charge_done() || (vbat_uv >= 4355000 && i_out_ua > -150000))) {
+		if (mb->usb_online &&
+		    (marie_hi6523_is_charge_done() ||
+		     (vbat_uv >= 4370000 && i_out_ua < 0 && i_out_ua > -180000))) {
 			mb->rem_uah += 1500;
 		} else if (!mb->usb_online && vbat_uv <= 3250000) {
 			/* Low-voltage cutoff protection -> reach 0% before UVLO */
 			mb->rem_uah -= 3000;
 		} else if (abs(i_out_ua) < 250000) {
 			/* Very gentle relaxed-OCV drift alignment (~0.1%/min max) */
-			s64 ocv_uah = (s64)ocv_cap * (MARIE_BAT_FCC_UAH / 100);
+			s64 fcc = mb->fcc_uah > 0 ? mb->fcc_uah : MARIE_BAT_FCC_UAH;
+			s64 ocv_uah = div_s64((s64)ocv_cap * fcc, 100);
 			s64 diff = ocv_uah - mb->rem_uah;
-			const s64 tol = (s64)MARIE_BAT_FCC_UAH * 4 / 100;
+			const s64 tol = div_s64(fcc * 4, 100);
 
 			if (diff > tol)
 				mb->rem_uah += 300;
@@ -1961,11 +2081,24 @@ static void marie_bat_poll_fn(struct work_struct *work)
 	}
 	mutex_unlock(&mb->lock);
 
-	marie_hi6523_update(usb_now, kirin710_dwc3_is_configured());
-	if (usb_changed) {
-		kirin710_dwc3_vbus_notify(usb_now);
-		if (!IS_ERR_OR_NULL(mb->usb_psy))
-			power_supply_changed(mb->usb_psy);
+	{
+		bool pc_now = usb_now && kirin710_dwc3_is_configured();
+		bool pc_changed;
+
+		mutex_lock(&mb->lock);
+		pc_changed = (pc_now != mb->pc_usb);
+		mb->pc_usb = pc_now;
+		mutex_unlock(&mb->lock);
+
+		marie_hi6523_update(usb_now, pc_now);
+		if (usb_changed)
+			kirin710_dwc3_vbus_notify(usb_now);
+		if (usb_changed || pc_changed) {
+			if (!IS_ERR_OR_NULL(mb->usb_psy))
+				power_supply_changed(mb->usb_psy);
+			if (!IS_ERR_OR_NULL(mb->ac_psy))
+				power_supply_changed(mb->ac_psy);
+		}
 	}
 	if (bat_changed && !IS_ERR_OR_NULL(mb->bat_psy))
 		power_supply_changed(mb->bat_psy);
@@ -1984,7 +2117,9 @@ static enum power_supply_property marie_bat_props[] = {
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_CHARGE_COUNTER,
 	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+	POWER_SUPPLY_PROP_CYCLE_COUNT,
 };
 
 static int marie_bat_get_prop(struct power_supply *psy,
@@ -2026,8 +2161,14 @@ static int marie_bat_get_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_TEMP:
 		val->intval = 280;
 		break;
+	case POWER_SUPPLY_PROP_CHARGE_FULL:
+		val->intval = (int)(mb->fcc_uah > 0 ? mb->fcc_uah : MARIE_BAT_FCC_UAH);
+		break;
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
 		val->intval = MARIE_BAT_DESIGN_UAH;
+		break;
+	case POWER_SUPPLY_PROP_CYCLE_COUNT:
+		val->intval = mb->cycle_count;
 		break;
 	default:
 		mutex_unlock(&mb->lock);
@@ -2045,8 +2186,10 @@ static const struct power_supply_desc marie_bat_desc = {
 	.get_property = marie_bat_get_prop,
 };
 
-static enum power_supply_property marie_usb_props[] = {
+static enum power_supply_property marie_chg_props[] = {
 	POWER_SUPPLY_PROP_ONLINE,
+	POWER_SUPPLY_PROP_VOLTAGE_MAX,
+	POWER_SUPPLY_PROP_CURRENT_MAX,
 };
 
 static int marie_usb_get_prop(struct power_supply *psy,
@@ -2055,21 +2198,64 @@ static int marie_usb_get_prop(struct power_supply *psy,
 {
 	struct marie_battery *mb = power_supply_get_drvdata(psy);
 
-	if (psp == POWER_SUPPLY_PROP_ONLINE) {
-		mutex_lock(&mb->lock);
-		val->intval = mb->usb_online ? 1 : 0;
+	mutex_lock(&mb->lock);
+	switch (psp) {
+	case POWER_SUPPLY_PROP_ONLINE:
+		val->intval = (mb->usb_online && mb->pc_usb) ? 1 : 0;
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
+		val->intval = 5000000;
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_MAX:
+		val->intval = 900000;
+		break;
+	default:
 		mutex_unlock(&mb->lock);
-		return 0;
+		return -EINVAL;
 	}
-	return -EINVAL;
+	mutex_unlock(&mb->lock);
+	return 0;
 }
 
 static const struct power_supply_desc marie_usb_desc = {
 	.name = "USB",
 	.type = POWER_SUPPLY_TYPE_USB,
-	.properties = marie_usb_props,
-	.num_properties = ARRAY_SIZE(marie_usb_props),
+	.properties = marie_chg_props,
+	.num_properties = ARRAY_SIZE(marie_chg_props),
 	.get_property = marie_usb_get_prop,
+};
+
+static int marie_ac_get_prop(struct power_supply *psy,
+			     enum power_supply_property psp,
+			     union power_supply_propval *val)
+{
+	struct marie_battery *mb = power_supply_get_drvdata(psy);
+
+	mutex_lock(&mb->lock);
+	switch (psp) {
+	case POWER_SUPPLY_PROP_ONLINE:
+		val->intval = (mb->usb_online && !mb->pc_usb) ? 1 : 0;
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
+		val->intval = 5000000;
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_MAX:
+		val->intval = 2000000;
+		break;
+	default:
+		mutex_unlock(&mb->lock);
+		return -EINVAL;
+	}
+	mutex_unlock(&mb->lock);
+	return 0;
+}
+
+static const struct power_supply_desc marie_ac_desc = {
+	.name = "Mains",
+	.type = POWER_SUPPLY_TYPE_MAINS,
+	.properties = marie_chg_props,
+	.num_properties = ARRAY_SIZE(marie_chg_props),
+	.get_property = marie_ac_get_prop,
 };
 
 static void marie_battery_register(void)
@@ -2095,11 +2281,14 @@ static void marie_battery_register(void)
 
 	mutex_lock(&marie_bat.lock);
 	marie_bat.usb_online = !!(st & BIT(1));
+	marie_bat.pc_usb = marie_bat.usb_online && kirin710_dwc3_is_configured();
+	marie_bat_load_hicoul_nv(&marie_bat);
 	marie_bat_sample_locked(&marie_bat, true);
 	mutex_unlock(&marie_bat.lock);
 
 	marie_bat.bat_psy = power_supply_register(&marie_bat.sdev->dev, &marie_bat_desc, &cfg);
 	marie_bat.usb_psy = power_supply_register(&marie_bat.sdev->dev, &marie_usb_desc, &cfg);
+	marie_bat.ac_psy = power_supply_register(&marie_bat.sdev->dev, &marie_ac_desc, &cfg);
 
 	kirin710_dwc3_typec_set_connected(marie_bat.usb_online);
 	if (!marie_bat.usb_online)
@@ -2240,6 +2429,8 @@ static int marie_reboot_notify(struct notifier_block *nb,
 			reason = 0x01;
 		else if (!strcmp(cmd, "recovery"))
 			reason = 0x02;
+		else if (!strcmp(cmd, "chargereboot"))
+			reason = 0x06;
 		else if (!strcmp(cmd, "erecovery"))
 			reason = 0x08;
 	}
@@ -2253,6 +2444,113 @@ static int marie_reboot_notify(struct notifier_block *nb,
 static struct notifier_block marie_reboot_nb = {
 	.notifier_call = marie_reboot_notify,
 };
+
+/* Kirin 710 hardware power-off via hisi,powerhold PL061 GPIO */
+#define MARIE_PL061_GPIODIR	0x400
+
+static void __iomem *marie_powerhold_base;
+static void __iomem *marie_sysctrl_base;
+static u32 marie_powerhold_offset;
+static u32 marie_powerhold_prot_off = 0xffff;
+static u32 marie_powerhold_prot_bit = 0xff;
+static struct sys_off_handler *marie_poweroff_handler;
+
+static int marie_sys_poweroff(struct sys_off_data *data)
+{
+	struct spmi_device *sdev = kirin710_pmic_get_sdev();
+	u32 val;
+	u8 reason = 0x06; /* chargereboot */
+
+	if (!marie_powerhold_base)
+		return NOTIFY_DONE;
+
+	pr_emerg("MARIE_POWEROFF: dropping powerhold GPIO (offset=%u)\n",
+		 marie_powerhold_offset);
+
+	if (marie_sysctrl_base && marie_powerhold_prot_off != 0xffff &&
+	    marie_powerhold_prot_bit < 16) {
+		val = readl(marie_sysctrl_base + marie_powerhold_prot_off);
+		val = (val & ~BIT(marie_powerhold_prot_bit)) |
+		      BIT(marie_powerhold_prot_bit + 16);
+		writel(val, marie_sysctrl_base + marie_powerhold_prot_off);
+	}
+
+	val = readl(marie_powerhold_base + MARIE_PL061_GPIODIR);
+	val |= (1u << marie_powerhold_offset);
+	writel(val, marie_powerhold_base + MARIE_PL061_GPIODIR);
+	writel(0, marie_powerhold_base + (1u << (marie_powerhold_offset + 2)));
+	dsb(sy);
+
+	/*
+	 * When unplugged, HI6555v200 cuts all power rails immediately above.
+	 * When VBUS/charger is connected, PMIC stays alive, so after 1s we
+	 * reboot with reason 0x06 ("chargereboot") into offline charger mode.
+	 */
+	mdelay(1000);
+	pr_emerg("MARIE_POWEROFF: still powered (VBUS present) -> chargereboot\n");
+	if (sdev)
+		spmi_ext_register_writel(sdev, PMIC_HRST_REG13_REG, &reason, 1);
+	do_kernel_restart("chargereboot");
+
+	while (1)
+		cpu_relax();
+
+	return NOTIFY_DONE;
+}
+
+static void marie_poweroff_register(void)
+{
+	struct device_node *np;
+	u32 off = 0;
+
+	np = of_find_compatible_node(NULL, NULL, "hisi,powerhold");
+	if (!np) {
+		pr_warn("MARIE_POWEROFF: hisi,powerhold DT node not found\n");
+		return;
+	}
+
+	marie_powerhold_base = of_iomap(np, 0);
+	if (!marie_powerhold_base || of_property_read_u32(np, "offset", &off)) {
+		pr_warn("MARIE_POWEROFF: failed to map hisi,powerhold\n");
+		if (marie_powerhold_base) {
+			iounmap(marie_powerhold_base);
+			marie_powerhold_base = NULL;
+		}
+		of_node_put(np);
+		return;
+	}
+	marie_powerhold_offset = off;
+
+	if (!of_property_read_u32(np, "powerhold_protect_offset", &off)) {
+		u32 bit = 0;
+
+		if (!of_property_read_u32(np, "powerhold_protect_bit", &bit)) {
+			marie_powerhold_prot_off = off;
+			marie_powerhold_prot_bit = bit;
+		}
+	}
+	of_node_put(np);
+
+	np = of_find_compatible_node(NULL, NULL, "hisilicon,sysctrl");
+	if (np) {
+		marie_sysctrl_base = of_iomap(np, 0);
+		of_node_put(np);
+	}
+
+	marie_poweroff_handler = register_sys_off_handler(SYS_OFF_MODE_POWER_OFF,
+							  SYS_OFF_PRIO_HIGH,
+							  marie_sys_poweroff,
+							  NULL);
+	if (IS_ERR(marie_poweroff_handler)) {
+		pr_warn("MARIE_POWEROFF: register_sys_off_handler err=%ld\n",
+			PTR_ERR(marie_poweroff_handler));
+		marie_poweroff_handler = NULL;
+	} else {
+		pr_info("MARIE_POWEROFF: registered powerhold handler (offset=%u prot=0x%x/%u)\n",
+			marie_powerhold_offset, marie_powerhold_prot_off,
+			marie_powerhold_prot_bit);
+	}
+}
 
 static struct delayed_work marie_deferred_boot_work;
 
@@ -2386,6 +2684,7 @@ static void marie_early_keys_fn(struct work_struct *work)
 
 static int __init marie_input_init(void)
 {
+	marie_poweroff_register();
 	INIT_DELAYED_WORK(&marie_early_keys_work, marie_early_keys_fn);
 	schedule_delayed_work(&marie_early_keys_work, msecs_to_jiffies(800));
 	INIT_DELAYED_WORK(&marie_deferred_boot_work, marie_deferred_boot_fn);
