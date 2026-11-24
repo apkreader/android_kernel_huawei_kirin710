@@ -39,6 +39,7 @@
 
 extern struct spmi_device *kirin710_pmic_get_sdev(void);
 extern void kirin710_dwc3_vbus_notify(bool vbus_online);
+extern void kirin710_dwc3_typec_set_connected(bool connected);
 extern struct spi_controller *marie_get_spi1_ctlr(void);
 extern int kirin710_xfreq_send_mhz(u32 cmd0, u32 mhz);
 
@@ -1918,6 +1919,7 @@ static void marie_battery_register(void)
 	marie_bat.bat_psy = power_supply_register(&marie_bat.sdev->dev, &marie_bat_desc, &cfg);
 	marie_bat.usb_psy = power_supply_register(&marie_bat.sdev->dev, &marie_usb_desc, &cfg);
 
+	kirin710_dwc3_typec_set_connected(marie_bat.usb_online);
 	if (!marie_bat.usb_online)
 		kirin710_dwc3_vbus_notify(false);
 

@@ -6,8 +6,10 @@
 #include <linux/module.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/usb/gadget.h>
+#include <linux/usb/typec.h>
 
 #include "core.h"
 
@@ -41,20 +43,57 @@ struct kirin710_dwc3 {
 	struct clk_bulk_data clocks[2];
 	struct clk *tcxo;
 	void __iomem *crg;
+	struct typec_port *typec_port;
+	struct typec_partner *typec_partner;
 	bool backup_clock;
 };
 
+static DEFINE_MUTEX(kirin710_dwc3_lock);
 static struct device *kirin710_dwc3_dev;
+static struct kirin710_dwc3 *kirin710_dwc3_ctx;
 
 static int kirin710_dwc3_match_child(struct device *dev, void *data)
 {
 	return of_device_is_compatible(dev->of_node, "snps,dwc3");
 }
 
+void kirin710_dwc3_typec_set_connected(bool connected)
+{
+	struct kirin710_dwc3 *usb;
+
+	mutex_lock(&kirin710_dwc3_lock);
+	usb = kirin710_dwc3_ctx;
+	if (!usb || !usb->typec_port) {
+		mutex_unlock(&kirin710_dwc3_lock);
+		return;
+	}
+
+	if (connected && !usb->typec_partner) {
+		struct typec_partner_desc desc = {
+			.usb_pd = 0,
+			.accessory = TYPEC_ACCESSORY_NONE,
+		};
+		struct typec_partner *partner;
+
+		typec_set_data_role(usb->typec_port, TYPEC_DEVICE);
+		typec_set_pwr_role(usb->typec_port, TYPEC_SINK);
+		partner = typec_register_partner(usb->typec_port, &desc);
+		if (!IS_ERR(partner))
+			usb->typec_partner = partner;
+	} else if (!connected && usb->typec_partner) {
+		typec_unregister_partner(usb->typec_partner);
+		usb->typec_partner = NULL;
+	}
+	mutex_unlock(&kirin710_dwc3_lock);
+}
+EXPORT_SYMBOL_GPL(kirin710_dwc3_typec_set_connected);
+
 void kirin710_dwc3_vbus_notify(bool vbus_online)
 {
 	struct device *child;
 	struct dwc3 *dwc;
+
+	kirin710_dwc3_typec_set_connected(vbus_online);
 
 	if (!kirin710_dwc3_dev)
 		return;
@@ -129,7 +168,18 @@ static void kirin710_dwc3_power_off(void *data)
 {
 	struct kirin710_dwc3 *usb = data;
 
+	mutex_lock(&kirin710_dwc3_lock);
 	kirin710_dwc3_dev = NULL;
+	kirin710_dwc3_ctx = NULL;
+	if (usb->typec_partner) {
+		typec_unregister_partner(usb->typec_partner);
+		usb->typec_partner = NULL;
+	}
+	if (usb->typec_port) {
+		typec_unregister_port(usb->typec_port);
+		usb->typec_port = NULL;
+	}
+	mutex_unlock(&kirin710_dwc3_lock);
 
 	writel(USB_RST_CORE, usb->crg + CRG_RST_ENABLE);
 	writel(USB_RST_PHY, usb->crg + CRG_RST_ENABLE);
@@ -218,7 +268,25 @@ static int kirin710_dwc3_probe(struct platform_device *pdev)
 	usleep_range(1000, 1500);
 	writel(tuning, phy + OTG_PHY_TUNING);
 
+	{
+		struct typec_capability cap = {
+			.type = TYPEC_PORT_SNK,
+			.data = TYPEC_PORT_UFP,
+			.revision = 0x0120,
+		};
+		struct typec_port *port = typec_register_port(dev, &cap);
+
+		if (!IS_ERR(port)) {
+			typec_set_data_role(port, TYPEC_DEVICE);
+			typec_set_pwr_role(port, TYPEC_SINK);
+			usb->typec_port = port;
+		}
+	}
+
+	mutex_lock(&kirin710_dwc3_lock);
 	kirin710_dwc3_dev = dev;
+	kirin710_dwc3_ctx = usb;
+	mutex_unlock(&kirin710_dwc3_lock);
 	return devm_of_platform_populate(dev);
 }
 
