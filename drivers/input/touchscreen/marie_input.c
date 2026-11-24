@@ -209,6 +209,10 @@ static struct platform_driver marie_gpio_keys_driver = {
 #define PMIC_IRQ_STAT1_REG	0x19c
 #define PMIC_PONKEY_DOWN_BIT	BIT(7)
 #define PMIC_PONKEY_UP_BIT	BIT(6)
+#define PMIC_VBUS_DISCONNECT_BIT BIT(2)
+#define PMIC_VBUS_CONNECT_BIT	BIT(1)
+
+static void marie_bat_vbus_irq_notify(void);
 
 struct marie_ponkey {
 	struct spmi_device *sdev;
@@ -241,6 +245,10 @@ static irqreturn_t marie_ponkey_irq_thread(int irq, void *data)
 		pr_info("MARIE_KEY: KEY_POWER UP (st0=0x%02x)\n", st0);
 		input_report_key(pk->input, KEY_POWER, 0);
 		input_sync(pk->input);
+	}
+	if (st0 & (PMIC_VBUS_CONNECT_BIT | PMIC_VBUS_DISCONNECT_BIT)) {
+		pr_info("MARIE_BAT: PMIC VBUS IRQ (st0=0x%02x)\n", st0);
+		marie_bat_vbus_irq_notify();
 	}
 
 	return IRQ_HANDLED;
@@ -286,8 +294,9 @@ static void marie_ponkey_init_work(struct work_struct *work)
 		return;
 	}
 
-	/* Mask all PMIC IRQs except powerkey down (bit 7) and up (bit 6), then clear pending */
-	mask0 = (u8)(~(PMIC_PONKEY_DOWN_BIT | PMIC_PONKEY_UP_BIT) & 0xff);
+	/* Unmask powerkey (bits 7,6) and VBUS insert/remove (bits 2,1) */
+	mask0 = (u8)(~(PMIC_PONKEY_DOWN_BIT | PMIC_PONKEY_UP_BIT |
+		       PMIC_VBUS_CONNECT_BIT | PMIC_VBUS_DISCONNECT_BIT) & 0xff);
 	mask1 = 0xff;
 	spmi_ext_register_writel(pk->sdev, PMIC_IRQ_MASK0_REG, &mask0, 1);
 	spmi_ext_register_writel(pk->sdev, PMIC_IRQ_MASK1_REG, &mask1, 1);
@@ -303,7 +312,8 @@ static void marie_ponkey_init_work(struct work_struct *work)
 		return;
 	}
 
-	pr_info("MARIE_KEY: PMIC powerkey registered (irq=%d, mask0=0x%02x)\n", pk->irq, mask0);
+	enable_irq_wake(pk->irq);
+	pr_info("MARIE_KEY: PMIC powerkey+VBUS IRQ registered (irq=%d, mask0=0x%02x)\n", pk->irq, mask0);
 }
 
 /* =========================================================================
@@ -1451,8 +1461,8 @@ static struct i2c_driver marie_lm36274_driver = {
 #define MARIE_BAT_FCC_UAH	3240000	/* Rated FCC from P30 lite DT (3240 mAh) */
 #define MARIE_BAT_DESIGN_UAH	3340000	/* Typical design capacity (3340 mAh) */
 #define MARIE_BAT_RBATT_MOHM	130	/* Internal resistance for OCV estimate */
-#define MARIE_BAT_POLL_MS	1000
-#define MARIE_BAT_SAMPLE_TICKS	5	/* 5s coulomb integration cadence */
+#define MARIE_BAT_POLL_MS	5000
+#define MARIE_BAT_SAMPLE_TICKS	1	/* 5s coulomb integration cadence */
 
 struct marie_ocv_pt {
 	int mv;
@@ -1486,6 +1496,7 @@ struct marie_battery {
 	int cap;
 	int status;
 	bool usb_online;
+	bool ready;
 	unsigned int poll_ticks;
 	ktime_t last_sample_kt;
 };
@@ -1748,6 +1759,15 @@ static void marie_bat_sample_locked(struct marie_battery *mb, bool init)
 					   mb->vbat_uv, mb->i_out_ua);
 }
 
+static void marie_bat_vbus_irq_notify(void)
+{
+	if (!READ_ONCE(marie_bat.ready))
+		return;
+	if (marie_bat.sdev)
+		pm_wakeup_event(&marie_bat.sdev->dev, 2500);
+	mod_delayed_work(system_wq, &marie_bat.poll_work, 0);
+}
+
 static void marie_bat_poll_fn(struct work_struct *work)
 {
 	struct marie_battery *mb = container_of(to_delayed_work(work),
@@ -1775,7 +1795,7 @@ static void marie_bat_poll_fn(struct work_struct *work)
 	} else if ((mb->poll_ticks % MARIE_BAT_SAMPLE_TICKS) == 0) {
 		marie_bat_sample_locked(mb, false);
 		if (mb->cap != prev_cap || mb->status != prev_status ||
-		    (mb->poll_ticks % 60) == 0)
+		    (mb->poll_ticks % 12) == 0)
 			bat_changed = true;
 	}
 	mutex_unlock(&mb->lock);
@@ -1923,7 +1943,9 @@ static void marie_battery_register(void)
 	if (!marie_bat.usb_online)
 		kirin710_dwc3_vbus_notify(false);
 
+	device_init_wakeup(&marie_bat.sdev->dev, true);
 	INIT_DELAYED_WORK(&marie_bat.poll_work, marie_bat_poll_fn);
+	WRITE_ONCE(marie_bat.ready, true);
 	schedule_delayed_work(&marie_bat.poll_work, msecs_to_jiffies(MARIE_BAT_POLL_MS));
 
 	pr_info("MARIE_BAT: registered Battery/USB (vbat=%d mV cur=%d mA ocv=%d mV -> %d%% rem=%lld mAh, cl_out=%u cl_in=%u clj=0x%02x st0=0x%02x st1=0x%02x hrst6=0x%02x)\n",
