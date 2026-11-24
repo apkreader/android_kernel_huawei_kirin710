@@ -467,6 +467,12 @@ void kirin710_sdio_set_card_present(bool present)
 }
 EXPORT_SYMBOL_GPL(kirin710_sdio_set_card_present);
 
+void dw_mci_sdio_card_detect_change(void)
+{
+	kirin710_sdio_set_card_present(true);
+}
+EXPORT_SYMBOL_GPL(dw_mci_sdio_card_detect_change);
+
 static int dw_mci_libra_parse_dt(struct dw_mci *host)
 {
 	struct k3_priv *priv;
@@ -545,8 +551,13 @@ static void dw_mci_libra_set_ios(struct dw_mci *host, struct mmc_ios *ios)
 	if (!ios->clock || ios->clock == priv->cur_speed)
 		return;
 
-	/* Cap to 50 MHz High-Speed for initial bring-up (avoids 1.8V UHS tuning). */
-	wanted = min_t(unsigned long, ios->clock, 50000000UL) * (GENCLK_DIV + 1);
+	/* Keep 3.2 MHz fixed sys clk for <= 400 kHz card-id; dw_mmc divides internally. */
+	if (ios->clock <= 400000) {
+		wanted = 3200000;
+	} else {
+		/* Cap to 50 MHz High-Speed for initial bring-up (avoids 1.8V UHS tuning). */
+		wanted = min_t(unsigned long, ios->clock, 50000000UL) * (GENCLK_DIV + 1);
+	}
 	ret = clk_set_rate(host->ciu_clk, wanted);
 	if (ret) {
 		dev_warn(host->dev, "libra failed to set ciu rate %luHz: %d\n",
