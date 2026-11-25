@@ -20,6 +20,41 @@ struct z_erofs_maprecorder {
 	bool partialref;
 };
 
+/*
+ * Huawei's old LZ4 indexes repeat the physical block across all entries in
+ * an extent. Bits 7:4 extend the 16-bit offset, and bits 15:8 count the
+ * remaining logical clusters. Translate to the upstream HEAD/NONHEAD form.
+ */
+static int z_erofs_load_huawei_lcluster(struct z_erofs_maprecorder *m,
+				       const struct z_erofs_lcluster_index *di,
+				       unsigned int advise)
+{
+	struct erofs_sb_info *sbi = EROFS_I_SB(m->inode);
+	unsigned int lclusterbits = EROFS_I(m->inode)->z_lclusterbits;
+	unsigned int offset = ((advise & 0xf0) << 12) | le16_to_cpu(di->di_clusterofs);
+	unsigned int distance = offset >> lclusterbits;
+	u32 block = le32_to_cpu(di->di_u.blkaddr);
+
+	if ((advise & 0x0f) != Z_EROFS_LCLUSTER_TYPE_HEAD2 ||
+	    distance > m->lcn || block <= sbi->meta_blkaddr ||
+	    block >= sbi->dif0.blocks)
+		return -EFSCORRUPTED;
+
+	if (distance) {
+		m->type = Z_EROFS_LCLUSTER_TYPE_NONHEAD;
+		m->clusterofs = 1 << lclusterbits;
+		m->delta[0] = distance;
+		m->delta[1] = max(advise >> 8, 1U);
+	} else {
+		m->type = Z_EROFS_LCLUSTER_TYPE_HEAD1;
+		m->partialref = false;
+		m->clusterofs = offset;
+		m->pblk = block;
+	}
+
+	return 0;
+}
+
 static int z_erofs_load_full_lcluster(struct z_erofs_maprecorder *m, u64 lcn)
 {
 	struct inode *const inode = m->inode;
@@ -38,6 +73,9 @@ static int z_erofs_load_full_lcluster(struct z_erofs_maprecorder *m, u64 lcn)
 
 	advise = le16_to_cpu(di->di_advise);
 	m->type = advise & Z_EROFS_LI_LCLUSTER_TYPE_MASK;
+	if (m->type == Z_EROFS_LCLUSTER_TYPE_HEAD2 &&
+	    EROFS_I_SB(inode)->huawei_legacy_indexes)
+		return z_erofs_load_huawei_lcluster(m, di, advise);
 	if (m->type == Z_EROFS_LCLUSTER_TYPE_NONHEAD) {
 		m->clusterofs = 1 << vi->z_lclusterbits;
 		m->delta[0] = le16_to_cpu(di->di_u.delta[0]);

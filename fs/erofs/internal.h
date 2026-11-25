@@ -122,6 +122,7 @@ struct erofs_sb_info {
 	unsigned int sync_decompress;	/* strategy for sync decompression */
 	unsigned int shrinker_run_no;
 	u16 available_compr_algs;
+	bool huawei_legacy_indexes;
 
 	/* pseudo inode to manage cached pages */
 	struct inode *managed_cache;

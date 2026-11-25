@@ -10,6 +10,7 @@
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
 #include <linux/exportfs.h>
+#include <linux/of.h>
 #include <linux/backing-dev.h>
 #include "xattr.h"
 
@@ -337,6 +338,13 @@ static int erofs_read_superblock(struct super_block *sb)
 	sbi->root_nid = le16_to_cpu(dsb->root_nid);
 	sbi->packed_nid = le64_to_cpu(dsb->packed_nid);
 	sbi->inos = le64_to_cpu(dsb->inos);
+#ifdef CONFIG_EROFS_FS_ZIP
+	/* Huawei's pre-upstream Kirin 710 images have this superblock layout. */
+	sbi->huawei_legacy_indexes = of_machine_is_compatible("hisilicon,kirin710") &&
+		!sbi->feature_compat && !sbi->feature_incompat && !sbi->root_nid &&
+		!sbi->inos && !le32_to_cpu(dsb->xattr_blkaddr) &&
+		sbi->meta_blkaddr == 1 && sbi->blkszbits == 12;
+#endif
 
 	sbi->build_time = le64_to_cpu(dsb->build_time);
 	sbi->build_time_nsec = le32_to_cpu(dsb->build_time_nsec);
