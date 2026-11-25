@@ -4,3 +4,11 @@ config SND_I2S_HI6210_I2S
 	select SND_SOC_GENERIC_DMAENGINE_PCM
 	help
 	  Hisilicon I2S
+
+config SND_SOC_MARIE
+	bool "Huawei P30 Lite (Marie) audio"
+	depends on ARCH_HISI && OF && SND_SOC=y && I2C=y
+	depends on COMMON_CLK_KIRIN710_USB=y && REGULATOR_KIRIN710_UFS=y
+	help
+	  Build the Huawei P30 Lite audio driver for the Kirin 710 ASP DMA,
+	  HI6555v2 codec and TFA9874 speaker amplifier.

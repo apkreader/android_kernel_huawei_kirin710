@@ -276,6 +276,28 @@ static long kirin710_g3d_round_rate(struct clk_hw *hw, unsigned long rate, unsig
 }
 
 static DEFINE_MUTEX(kirin710_xfreq_lock);
+static DEFINE_MUTEX(kirin710_ip_reg_lock);
+static struct mbox_client marie_ip_reg_client;
+static struct mbox_chan *marie_ip_reg_chan;
+
+static struct mbox_chan *kirin710_get_ip_reg_chan_locked(void)
+{
+	if (marie_ip_reg_chan)
+		return marie_ip_reg_chan;
+	if (!marie_saved_dvfs || !marie_saved_dvfs->dev)
+		return ERR_PTR(-EPROBE_DEFER);
+	marie_ip_reg_client.dev = marie_saved_dvfs->dev;
+	marie_ip_reg_client.tx_block = true;
+	marie_ip_reg_client.tx_tout = 300;
+	marie_ip_reg_chan = kirin710_mbox_request_channel(&marie_ip_reg_client, 14);
+	if (IS_ERR(marie_ip_reg_chan)) {
+		struct mbox_chan *err = marie_ip_reg_chan;
+		marie_ip_reg_chan = NULL;
+		return err;
+	}
+	devm_add_action_or_reset(marie_saved_dvfs->dev, kirin710_dvfs_free_channel, marie_ip_reg_chan);
+	return marie_ip_reg_chan;
+}
 
 static int kirin710_g3d_set_rate(struct clk_hw *hw, unsigned long rate, unsigned long parent_rate)
 {
@@ -314,7 +336,9 @@ static int kirin710_g3d_reg_enable(struct regulator_dev *rdev)
 	u32 msg[8] = { reg->enable_cmd[0], reg->enable_cmd[1] };
 	int ret;
 
+	mutex_lock(&kirin710_ip_reg_lock);
 	ret = mbox_send_message(reg->chan, msg);
+	mutex_unlock(&kirin710_ip_reg_lock);
 	if (ret < 0)
 		return ret;
 	msleep(10);
@@ -328,7 +352,9 @@ static int kirin710_g3d_reg_disable(struct regulator_dev *rdev)
 	u32 msg[8] = { reg->disable_cmd[0], reg->disable_cmd[1] };
 	int ret;
 
+	mutex_lock(&kirin710_ip_reg_lock);
 	ret = mbox_send_message(reg->chan, msg);
+	mutex_unlock(&kirin710_ip_reg_lock);
 	if (ret < 0)
 		return ret;
 	reg->enabled = false;
@@ -426,15 +452,13 @@ void marie_register_gpu_power_deferred(void)
 		}
 		reg->dev = dev;
 		reg->cur_uv = 800000;
-		reg->client.dev = dev;
-		reg->client.tx_block = true;
-		reg->client.tx_tout = 300;
-		reg->chan = kirin710_mbox_request_channel(&reg->client, 14);
+		mutex_lock(&kirin710_ip_reg_lock);
+		reg->chan = kirin710_get_ip_reg_chan_locked();
+		mutex_unlock(&kirin710_ip_reg_lock);
 		if (IS_ERR(reg->chan)) {
 			of_node_put(np);
 			break;
 		}
-		devm_add_action_or_reset(dev, kirin710_dvfs_free_channel, reg->chan);
 
 		desc->name = "g3d";
 		desc->type = REGULATOR_VOLTAGE;
@@ -477,6 +501,26 @@ int kirin710_xfreq_send_mhz(u32 cmd0, u32 mhz)
 	return ret < 0 ? ret : 0;
 }
 EXPORT_SYMBOL_GPL(kirin710_xfreq_send_mhz);
+
+int kirin710_ip_reg_send(u32 cmd0, u32 cmd1)
+{
+	u32 msg[8] = { cmd0, cmd1 };
+	struct mbox_chan *chan;
+	int ret;
+
+	mutex_lock(&kirin710_ip_reg_lock);
+	chan = kirin710_get_ip_reg_chan_locked();
+	if (IS_ERR(chan)) {
+		mutex_unlock(&kirin710_ip_reg_lock);
+		return PTR_ERR(chan);
+	}
+	ret = mbox_send_message(chan, msg);
+	mutex_unlock(&kirin710_ip_reg_lock);
+	if (ret >= 0)
+		usleep_range(1000, 2000);
+	return ret < 0 ? ret : 0;
+}
+EXPORT_SYMBOL_GPL(kirin710_ip_reg_send);
 
 static int kirin710_dvfs_probe(struct platform_device *pdev)
 {
