@@ -18,6 +18,9 @@
 #include "smc.h"
 #include <linux/timekeeping.h>
 #include <linux/delay.h>
+#include <linux/arm-smccc.h>
+#include <linux/io.h>
+#include <linux/of.h>
 
 
 typedef enum {
@@ -353,3 +356,49 @@ int rpmb_agent_register(void)
 }
 
 EXPORT_SYMBOL(rpmb_agent_register);
+
+#define KIRIN710_BL31_SHMEM_BASE	0x13561000ULL
+#define KIRIN710_RPMB_SVC_REQUEST_ADDR	0xc600FF04ULL
+#define KIRIN710_RPMB_SVC_GET_DEV_VER	0xc600FFFCULL
+#define KIRIN710_BOOT_DEVICE_UFS	1ULL
+
+static void __iomem *kirin710_rpmb_bl31_mem;
+
+static int __init kirin710_rpmb_bl31_init(void)
+{
+	struct device_node *np;
+	struct arm_smccc_res res = {};
+	u32 data[2] = {0};
+	phys_addr_t phy;
+
+	np = of_find_compatible_node(NULL, NULL, "hisilicon,hisi-rpmb");
+	if (!np)
+		return 0;
+
+	if (of_property_read_u32_array(np, "hisi,bl31-share-mem", data, 2)) {
+		of_node_put(np);
+		return 0;
+	}
+	of_node_put(np);
+
+	phy = KIRIN710_BL31_SHMEM_BASE + data[0];
+	kirin710_rpmb_bl31_mem = ioremap_wc(phy, data[1]);
+	if (!kirin710_rpmb_bl31_mem)
+		return -ENOMEM;
+
+	arm_smccc_smc(KIRIN710_RPMB_SVC_REQUEST_ADDR, phy,
+		      KIRIN710_BOOT_DEVICE_UFS, 0, 0, 0, 0, 0, &res);
+	if (res.a0) {
+		pr_err("kirin710-rpmb: BL31 RPMB_SVC_REQUEST_ADDR failed: %ld\n",
+		       (long)res.a0);
+		iounmap(kirin710_rpmb_bl31_mem);
+		kirin710_rpmb_bl31_mem = NULL;
+		return 0;
+	}
+
+	arm_smccc_smc(KIRIN710_RPMB_SVC_GET_DEV_VER, 0, 0, 0, 0, 0, 0, 0, &res);
+	pr_info("kirin710-rpmb: BL31 RPMB ready (phy=0x%llx, dev_ver=%ld)\n",
+		(u64)phy, (long)res.a0);
+	return 0;
+}
+late_initcall(kirin710_rpmb_bl31_init);
