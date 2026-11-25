@@ -57,9 +57,16 @@
 	/*
 	 * DO NOT MODIFY. Image header expected by Linux boot-loaders.
 	 */
+#ifdef CONFIG_ARCH_HISI
+.L_head:
+	b	primary_entry			// Huawei Kirin 710 bootloader enters at offset 0
+	.long	0
+	.quad	0x80000				// Kirin 710 bootloader requires 0x80000 text_offset
+#else
 	efi_signature_nop			// special NOP to identity as PE/COFF executable
 	b	primary_entry			// branch to kernel start, magic
 	.quad	0				// Image load offset from start of RAM, little-endian
+#endif
 	le64sym	_kernel_size_le			// Effective size of kernel image, little-endian
 	le64sym	_kernel_flags_le		// Informative flags, little-endian
 	.quad	0				// reserved
