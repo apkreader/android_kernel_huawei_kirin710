@@ -119,3 +119,4 @@ obj-y					+= blink/
 
 # Simple LED drivers
 obj-y					+= simple/
+obj-$(CONFIG_LEDS_CLASS) += leds-marie-flash.o
