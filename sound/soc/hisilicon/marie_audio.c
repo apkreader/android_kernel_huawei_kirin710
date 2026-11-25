@@ -891,14 +891,15 @@ static void marie_apply_routes_locked(struct marie_audio *ma)
 				BIT(17) | BIT(18) | BIT(19) | BIT(22) | BIT(23) | BIT(24) | BIT(25),
 				BIT(17) | BIT(18) | BIT(19) | BIT(22) | BIT(23) | BIT(24) | BIT(25));
 		marie_sc_update(ma, SC_DAC_FILTER_CTRL_REG, BIT(8) | BIT(9), BIT(8) | BIT(9));
-		if ((marie_sc_read(ma, SC_ADC_FILTER_CTRL_REG) & (0x3fU << 26)) == 0)
-			marie_sc_update(ma, SC_ADC_FILTER_CTRL_REG,
-					(0x3fU << 26) | (0x3fU << 16),
-					(18U << 26) | (18U << 16));
+		marie_sc_update(ma, SC_ADC_FILTER_CTRL_REG,
+				(0x3fU << 26) | (0x3fU << 16),
+				(40U << 26) | (40U << 16));
 		/* ADCL_DIN=ADC1(0), ADCR_DIN=ADC2(1), AUDIO_UL_MUX=ADCL(1), AUDIO_UR_MUX=ADCR(1) */
 		marie_sc_update(ma, SC_CODEC_DIN_MUX_REG,
 				(3U << 22) | (3U << 20) | (3U << 13) | (3U << 11),
 				(1U << 22) | (1U << 20) | (0U << 13) | (1U << 11));
+		/* Let MICBIAS and analog PGA settle before enabling capture AFIFO */
+		msleep(25);
 		marie_sc_update(ma, SC_CLK_EN0_REG, BIT(5) | BIT(6), 0);
 		udelay(5);
 		marie_sc_update(ma, SC_CLK_EN0_REG, BIT(5) | BIT(6), BIT(5) | BIT(6));
@@ -1809,7 +1810,13 @@ static int marie_pcm_copy(struct snd_pcm_substream *substream, int channel,
 		else
 			dsb(sy);
 	} else {
-		dsb(sy);
+		unsigned int fbytes = frames_to_bytes(runtime, 1);
+
+		if (fbytes)
+			marie_cp_sync_frames(ma, pos / fbytes, bytes / fbytes,
+					     runtime->buffer_size, runtime->channels);
+		else
+			dsb(sy);
 		if (copy_to_iter(hwbuf, bytes, iter) != bytes)
 			return -EFAULT;
 	}
@@ -2370,7 +2377,7 @@ static int marie_audio_probe(struct platform_device *pdev)
 	ma->spk_vol = 85;
 	ma->hp_vol = 12;
 	ma->ear_vol = 12;
-	ma->mic_vol = 5;
+	ma->mic_vol = 2;
 
 	ma->sctrl = devm_ioremap(dev, MARIE_SCTRL_PHYS, 0x1000);
 	ma->crgctrl = devm_ioremap(dev, MARIE_CRGCTRL_PHYS, 0x1000);
