@@ -1752,7 +1752,7 @@ static void marie_bat_load_hicoul_nv(struct marie_battery *mb)
 		mb->fcc_uah = nv.limit_fcc;
 
 	if (nv.charge_cycles >= 0 && nv.charge_cycles < 1000000)
-		mb->cycle_count = nv.charge_cycles / 100;
+		mb->cycle_count = DIV_ROUND_UP(nv.charge_cycles, 100);
 
 	pr_info("MARIE_BAT: HICOUL nv@0x%lx cycles=%d (%d.%02d) fcc=%lld uAh (limit=%d full=%d qmax=%d) v_off=(%d,%d) c_off=(%d,%d)\n",
 		marie_pmu_nv_addr, mb->cycle_count,
