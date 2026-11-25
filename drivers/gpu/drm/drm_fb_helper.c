@@ -30,6 +30,12 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/console.h>
+#include <linux/init.h>
+#include <linux/string.h>
+
+#ifdef CONFIG_ARM64
+extern int marie_lm36274_set_brightness(unsigned int brightness);
+#endif
 #include <linux/sysrq.h>
 
 #include <drm/drm_atomic.h>
@@ -318,6 +324,10 @@ int drm_fb_helper_blank(int blank, struct fb_info *info)
 	if (oops_in_progress)
 		return -EBUSY;
 
+#ifdef CONFIG_ARM64
+	if (saved_command_line && strstr(saved_command_line, "androidboot.mode=charger"))
+		marie_lm36274_set_brightness(blank == FB_BLANK_UNBLANK ? 128 : 0);
+#endif
 	switch (blank) {
 	/* Display: On; HSync: On, VSync: On */
 	case FB_BLANK_UNBLANK:

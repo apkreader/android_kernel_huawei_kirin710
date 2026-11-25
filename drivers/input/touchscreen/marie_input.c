@@ -2419,7 +2419,7 @@ static int marie_reboot_notify(struct notifier_block *nb,
 {
 	struct spmi_device *sdev = kirin710_pmic_get_sdev();
 	const char *cmd = data;
-	u8 reason = 0x00;
+	u8 reason = 0x10; /* COLDBOOT: normal warm reboot (avoids charger-mode loop on VBUS) */
 
 	if (!sdev || action != SYS_RESTART)
 		return NOTIFY_DONE;
@@ -2466,6 +2466,11 @@ static int marie_sys_poweroff(struct sys_off_data *data)
 
 	pr_emerg("MARIE_POWEROFF: dropping powerhold GPIO (offset=%u)\n",
 		 marie_powerhold_offset);
+
+	if (sdev) {
+		u8 cold = 0x00; /* AP_S_COLDBOOT */
+		spmi_ext_register_writel(sdev, PMIC_HRST_REG13_REG, &cold, 1);
+	}
 
 	if (marie_sysctrl_base && marie_powerhold_prot_off != 0xffff &&
 	    marie_powerhold_prot_bit < 16) {
