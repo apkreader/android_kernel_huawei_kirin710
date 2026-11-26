@@ -23,6 +23,7 @@ static struct kirin710_cma_heap sync_heap;
 static int __init kirin710_sync_cma_init(struct reserved_mem *rmem)
 {
 	unsigned long node = rmem->fdt_node;
+	int ret;
 
 	if (!of_flat_dt_is_compatible(0, "hisilicon,kirin710"))
 		return -ENODEV;
@@ -31,8 +32,11 @@ static int __init kirin710_sync_cma_init(struct reserved_mem *rmem)
 	    of_get_flat_dt_prop(node, "no-map", NULL))
 		return -EINVAL;
 
-	return cma_init_reserved_mem(rmem->base, rmem->size, 0,
-				     rmem->name, &sync_cma, false);
+	ret = cma_init_reserved_mem(rmem->base, rmem->size, 0,
+				    rmem->name, &sync_cma, false);
+	if (!ret)
+		rmem->priv = sync_cma;
+	return ret;
 }
 RESERVEDMEM_OF_DECLARE(kirin710_sync_cma, "hisi-cma-pool", kirin710_sync_cma_init);
 

@@ -851,6 +851,54 @@ static const uint64_t simpledrm_primary_plane_format_modifiers[] = {
 	DRM_FORMAT_MOD_INVALID
 };
 
+#ifdef CONFIG_ARM64
+static u32 marie_get_zero_copy_paddr(struct simpledrm_device *sdev,
+				     struct drm_framebuffer *fb)
+{
+	struct drm_gem_dma_object *dma_obj;
+	u64 paddr;
+
+	if (!marie_dss_tribuf || !fb || !fb->obj[0] ||
+	    !fb->obj[0]->funcs || fb->obj[0]->funcs->vm_ops != &drm_gem_dma_vm_ops ||
+	    fb->width != sdev->mode.hdisplay || fb->height != sdev->mode.vdisplay ||
+	    (fb->pitches[0] & 15) != 0)
+		return 0;
+
+	if (fb->format->format != DRM_FORMAT_ABGR8888 &&
+	    fb->format->format != DRM_FORMAT_XBGR8888 &&
+	    fb->format->format != DRM_FORMAT_ARGB8888 &&
+	    fb->format->format != DRM_FORMAT_XRGB8888)
+		return 0;
+
+	dma_obj = to_drm_gem_dma_obj(fb->obj[0]);
+	paddr = (u64)dma_obj->dma_addr + fb->offsets[0];
+	if (!paddr || paddr >= 0x100000000ULL)
+		return 0;
+
+	return (u32)paddr;
+}
+
+static int marie_simpledrm_begin_fb_access(struct drm_plane *plane,
+					   struct drm_plane_state *new_plane_state)
+{
+	struct simpledrm_device *sdev = simpledrm_device_of_dev(plane->dev);
+
+	if (marie_get_zero_copy_paddr(sdev, new_plane_state->fb))
+		return 0;
+	return drm_gem_begin_shadow_fb_access(plane, new_plane_state);
+}
+
+static void marie_simpledrm_end_fb_access(struct drm_plane *plane,
+					  struct drm_plane_state *old_plane_state)
+{
+	struct simpledrm_device *sdev = simpledrm_device_of_dev(plane->dev);
+
+	if (marie_get_zero_copy_paddr(sdev, old_plane_state->fb))
+		return;
+	drm_gem_end_shadow_fb_access(plane, old_plane_state);
+}
+#endif
+
 static int simpledrm_primary_plane_helper_atomic_check(struct drm_plane *plane,
 						       struct drm_atomic_state *state)
 {
@@ -876,6 +924,10 @@ static int simpledrm_primary_plane_helper_atomic_check(struct drm_plane *plane,
 	else if (!new_plane_state->visible)
 		return 0;
 
+#ifdef CONFIG_ARM64
+	if (marie_get_zero_copy_paddr(sdev, new_fb))
+		return 0;
+#endif
 	if (new_fb->format != sdev->format) {
 		void *buf;
 
@@ -902,6 +954,35 @@ static void simpledrm_primary_plane_helper_atomic_update(struct drm_plane *plane
 	struct drm_rect damage;
 	int ret, idx;
 
+#ifdef CONFIG_ARM64
+	{
+		u32 zc_paddr = marie_get_zero_copy_paddr(sdev, fb);
+
+		if (zc_paddr) {
+			bool is_bgr = (fb->format->format == DRM_FORMAT_ABGR8888 ||
+				       fb->format->format == DRM_FORMAT_XBGR8888);
+			u32 dfc_fmt = is_bgr ? (13U << 1) : (6U << 1);
+			unsigned long dflags;
+
+			if (!drm_dev_enter(dev, &idx))
+				return;
+			dsb(st);
+			spin_lock_irqsave(&marie_dss_lock, dflags);
+			writel(1, marie_dss_base + 0x10804);
+			writel(zc_paddr, marie_dss_base + marie_dss_dma_off + 0x60);
+			writel(fb->pitches[0] >> 4, marie_dss_base + marie_dss_dma_off + 0x64);
+			writel(dfc_fmt, marie_dss_base + marie_dss_dma_off + 0x10c);
+			writel(1, marie_dss_base + marie_dss_flush_off);
+			writel(1, marie_dss_base + 0x10128);
+			dsb(st);
+			writel(0, marie_dss_base + 0x10804);
+			spin_unlock_irqrestore(&marie_dss_lock, dflags);
+			drm_dev_exit(idx);
+			return;
+		}
+	}
+#endif
+
 	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
 	if (ret)
 		return;
@@ -923,38 +1004,6 @@ static void simpledrm_primary_plane_helper_atomic_update(struct drm_plane *plane
 			unsigned int marie_flip_idx = 0;
 			bool marie_do_flip = false;
 #endif
-		/* Zero-copy CMA direct scanout on Kirin 710 DSS V320 */
-		if (marie_dss_tribuf && fb->obj[0] &&
-		    fb->obj[0]->funcs && fb->obj[0]->funcs->vm_ops == &drm_gem_dma_vm_ops &&
-		    fb->width == sdev->mode.hdisplay && fb->height == sdev->mode.vdisplay &&
-		    (fb->pitches[0] & 15) == 0 &&
-		    (fb->format->format == DRM_FORMAT_ABGR8888 ||
-		     fb->format->format == DRM_FORMAT_XBGR8888 ||
-		     fb->format->format == DRM_FORMAT_ARGB8888 ||
-		     fb->format->format == DRM_FORMAT_XRGB8888)) {
-			struct drm_gem_dma_object *dma_obj = to_drm_gem_dma_obj(fb->obj[0]);
-			u64 paddr = (u64)dma_obj->dma_addr + fb->offsets[0];
-
-			if (paddr && paddr < 0x100000000ULL) {
-				bool is_bgr = (fb->format->format == DRM_FORMAT_ABGR8888 ||
-					       fb->format->format == DRM_FORMAT_XBGR8888);
-				u32 dfc_fmt = is_bgr ? (13U << 1) : (6U << 1);
-				unsigned long dflags;
-
-				dsb(st);
-				spin_lock_irqsave(&marie_dss_lock, dflags);
-				writel(1, marie_dss_base + 0x10804);
-				writel((u32)paddr, marie_dss_base + marie_dss_dma_off + 0x60);
-				writel(fb->pitches[0] >> 4, marie_dss_base + marie_dss_dma_off + 0x64);
-				writel(dfc_fmt, marie_dss_base + marie_dss_dma_off + 0x10c);
-				writel(1, marie_dss_base + marie_dss_flush_off);
-				writel(1, marie_dss_base + 0x10128);
-				dsb(st);
-				writel(0, marie_dss_base + 0x10804);
-				spin_unlock_irqrestore(&marie_dss_lock, dflags);
-				goto marie_zc_done;
-			}
-		}
 		if (sdev->format->format == DRM_FORMAT_XRGB8888 &&
 		    (fb->format->format == DRM_FORMAT_ABGR8888 ||
 		     fb->format->format == DRM_FORMAT_XBGR8888 ||
@@ -1130,8 +1179,6 @@ static void simpledrm_primary_plane_helper_atomic_update(struct drm_plane *plane
 				dcache_clean_poc(start, start + len);
 			}
 		}
-marie_zc_done:
-		(void)0;
 		}
 #endif
 	}
@@ -1201,7 +1248,12 @@ static int simpledrm_primary_plane_helper_get_scanout_buffer(struct drm_plane *p
 }
 
 static const struct drm_plane_helper_funcs simpledrm_primary_plane_helper_funcs = {
+#ifdef CONFIG_ARM64
+	.begin_fb_access = marie_simpledrm_begin_fb_access,
+	.end_fb_access = marie_simpledrm_end_fb_access,
+#else
 	DRM_GEM_SHADOW_PLANE_HELPER_FUNCS,
+#endif
 	.atomic_check = simpledrm_primary_plane_helper_atomic_check,
 	.atomic_update = simpledrm_primary_plane_helper_atomic_update,
 	.atomic_disable = simpledrm_primary_plane_helper_atomic_disable,
@@ -1733,17 +1785,24 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 	drm_mode_config_reset(dev);
 #ifdef CONFIG_ARM64
 	{
-		struct device_node *cma_np = of_find_node_by_name(NULL, "fastboot-cma-mem");
+		static const char * const cma_names[] = { "hisi_cma", "fastboot-cma-mem" };
+		unsigned int ci;
 
-		if (cma_np) {
-			struct reserved_mem *rmem = of_reserved_mem_lookup(cma_np);
+		for (ci = 0; ci < ARRAY_SIZE(cma_names); ci++) {
+			struct device_node *cma_np = of_find_node_by_name(NULL, cma_names[ci]);
+			struct reserved_mem *rmem;
 
+			if (!cma_np)
+				continue;
+			rmem = of_reserved_mem_lookup(cma_np);
 			if (rmem && rmem->priv) {
 				dev->dev->cma_area = rmem->priv;
 				dma_coerce_mask_and_coherent(dev->dev, DMA_BIT_MASK(32));
 				marie_cma_ready = true;
-				pr_info("kirin710-dss: zero-copy CMA scanout bound (%llu MiB)\n",
-					(unsigned long long)rmem->size >> 20);
+				pr_info("kirin710-dss: zero-copy CMA scanout bound to %s (%llu MiB)\n",
+					cma_names[ci], (unsigned long long)rmem->size >> 20);
+				of_node_put(cma_np);
+				break;
 			}
 			of_node_put(cma_np);
 		}
