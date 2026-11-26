@@ -22,12 +22,40 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_blend.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_vblank.h>
 
+#define MARIE_NUM_OVERLAYS	3
+#define MARIE_NUM_PLANES	(1 + MARIE_NUM_OVERLAYS)
+
+struct marie_dss_rch {
+	const char *name;
+	u8 rch_id;
+	u32 dma_off;
+	u32 dfc_off;
+	u32 mif_off;
+	u32 aif_off;
+	u32 mutex_off;
+	u32 flush_off;
+	u32 ov_oen_off;
+	u32 starty_off;
+	u8 smmu_sid;
+	u8 smmu_cnt;
+};
+
+static const struct marie_dss_rch marie_dss_rchs[MARIE_NUM_PLANES] = {
+	{ "D2", 6, 0x50000, 0x50100, 0x0a0e0, 0x070c0, 0x10848, 0x10118, 0x10178, 0x101d8, 16, 1 },
+	{ "D3", 7, 0x51000, 0x51100, 0x0a100, 0x070e0, 0x1084c, 0x1011c, 0x1017c, 0x101dc, 17, 1 },
+	{ "D0", 0, 0x52000, 0x52100, 0x0a020, 0x07000, 0x10830, 0x10100, 0x10160, 0x101c0,  0, 4 },
+	{ "D1", 1, 0x53000, 0x53100, 0x0a040, 0x07020, 0x10834, 0x10104, 0x10164, 0x101c4,  4, 4 },
+};
+
 static bool marie_fb_is_wc;
 static bool marie_cma_ready;
+static bool marie_ovl_active;
 static u32 marie_dss_default_stride;
+static u32 marie_dss_default_buf_ctrl;
 static void *marie_fb_buf[3];
 static u32 marie_fb_phys[3];
 static DEFINE_SPINLOCK(marie_dss_lock);
@@ -98,9 +126,29 @@ static void marie_dss_init(u32 fb_phys0, u32 fb_phys1, u32 fb_phys2)
 			marie_dss_dma_off = rchs[i].dma_off;
 			marie_dss_flush_off = rchs[i].flush_off;
 			marie_dss_default_stride = readl(marie_dss_base + rchs[i].dma_off + 0x64);
-			pr_info("kirin710-dss: active RCH_%s scanout at 0x%08x\n",
-				rchs[i].name, addr);
+			marie_dss_default_buf_ctrl = readl(marie_dss_base + rchs[i].dma_off + 0x800);
+			pr_info("kirin710-dss: active RCH_%s scanout at 0x%08x (buf_ctrl=0x%08x)\n",
+				rchs[i].name, addr, marie_dss_default_buf_ctrl);
 			break;
+		}
+	}
+
+	/* Ensure SMMU bypass + MIF physical mode + AIF0 AXI_CHN0 for D2/D3/D0/D1 */
+	if (marie_dss_dma_off) {
+		for (i = 0; i < MARIE_NUM_PLANES; i++) {
+			const struct marie_dss_rch *rch = &marie_dss_rchs[i];
+			u8 s;
+			u32 v;
+
+			for (s = 0; s < rch->smmu_cnt; s++) {
+				u32 off = 0x80020 + (rch->smmu_sid + s) * 4;
+
+				writel(readl(marie_dss_base + off) | BIT(0), marie_dss_base + off);
+			}
+			v = readl(marie_dss_base + rch->mif_off + 0x04);
+			writel(v | BIT(5), marie_dss_base + rch->mif_off + 0x04);
+			v = readl(marie_dss_base + rch->aif_off + 0x00);
+			writel(v & ~(BIT(0) | (0x7U << 8)), marie_dss_base + rch->aif_off + 0x00);
 		}
 	}
 
@@ -167,11 +215,16 @@ static void marie_simpledrm_crtc_atomic_disable(struct drm_crtc *crtc,
 		drm_crtc_vblank_off(crtc);
 }
 
+static void marie_dss_commit_ovl0(struct drm_crtc *crtc,
+				  struct drm_atomic_state *state);
+
 static void marie_simpledrm_crtc_atomic_flush(struct drm_crtc *crtc,
 					      struct drm_atomic_state *state)
 {
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 	struct drm_pending_vblank_event *event = crtc_state->event;
+
+	marie_dss_commit_ovl0(crtc, state);
 
 	if (!event)
 		return;
@@ -207,7 +260,8 @@ static int marie_simpledrm_dumb_create(struct drm_file *file_priv,
 				       struct drm_mode_create_dumb *args)
 {
 	if (file_priv && file_priv->filp && marie_cma_ready &&
-	    args->width >= 1080 && args->height >= 2312 && args->bpp == 32) {
+	    args->bpp == 32 && args->width >= 16 && args->height >= 16) {
+		args->pitch = ALIGN(args->width * 4U, 64U);
 		if (!drm_gem_dma_dumb_create(file_priv, dev, args))
 			return 0;
 	}
@@ -519,6 +573,9 @@ struct simpledrm_device {
 	uint32_t formats[8];
 	size_t nformats;
 	struct drm_plane primary_plane;
+#ifdef CONFIG_ARM64
+	struct drm_plane overlay_planes[MARIE_NUM_OVERLAYS];
+#endif
 	struct drm_crtc crtc;
 	struct drm_encoder encoder;
 	struct drm_connector connector;
@@ -852,15 +909,13 @@ static const uint64_t simpledrm_primary_plane_format_modifiers[] = {
 };
 
 #ifdef CONFIG_ARM64
-static u32 marie_get_zero_copy_paddr(struct simpledrm_device *sdev,
-				     struct drm_framebuffer *fb)
+static u32 marie_get_plane_paddr(struct drm_framebuffer *fb)
 {
 	struct drm_gem_dma_object *dma_obj;
 	u64 paddr;
 
 	if (!marie_dss_tribuf || !fb || !fb->obj[0] ||
 	    !fb->obj[0]->funcs || fb->obj[0]->funcs->vm_ops != &drm_gem_dma_vm_ops ||
-	    fb->width != sdev->mode.hdisplay || fb->height != sdev->mode.vdisplay ||
 	    (fb->pitches[0] & 15) != 0)
 		return 0;
 
@@ -878,12 +933,289 @@ static u32 marie_get_zero_copy_paddr(struct simpledrm_device *sdev,
 	return (u32)paddr;
 }
 
+static bool marie_plane_can_hw_scanout(struct simpledrm_device *sdev,
+				       struct drm_plane_state *st)
+{
+	u32 src_x, src_y, src_w, src_h;
+
+	if (!st || !st->visible || !st->fb || !marie_get_plane_paddr(st->fb))
+		return false;
+
+	if ((st->src_x | st->src_y | st->src_w | st->src_h) & 0xffffU)
+		return false;
+
+	src_x = st->src_x >> 16;
+	src_y = st->src_y >> 16;
+	src_w = st->src_w >> 16;
+	src_h = st->src_h >> 16;
+
+	if (src_w < 4 || src_h < 2)
+		return false;
+	if (drm_rect_width(&st->dst) != (int)src_w ||
+	    drm_rect_height(&st->dst) != (int)src_h)
+		return false;
+	if (st->dst.x1 < 0 || st->dst.y1 < 0 ||
+	    st->dst.x2 > sdev->mode.hdisplay || st->dst.y2 > sdev->mode.vdisplay)
+		return false;
+	if (src_x + src_w > st->fb->width || src_y + src_h > st->fb->height)
+		return false;
+
+	return true;
+}
+
+static u32 marie_dss_ovl_alpha_reg(u32 fourcc, u16 pixel_blend_mode, u16 alpha16)
+{
+	struct ovl_alpha_cfg {
+		u32 src_amode, src_gmode, alpha_offsrc, src_lmode, src_pmode, alpha_smode;
+		u32 dst_amode, dst_gmode, alpha_offdst, dst_pmode, fix_mode;
+	} cfg;
+	bool has_alpha = (fourcc == DRM_FORMAT_ARGB8888 || fourcc == DRM_FORMAT_ABGR8888);
+	u32 glb = alpha16 >> 8;
+
+	if (pixel_blend_mode == DRM_MODE_BLEND_PREMULTI) {
+		if (has_alpha) {
+			if (glb < 0xff)
+				cfg = (struct ovl_alpha_cfg){ 2, 1, 0, 0, 0, 0,  3, 2, 0, 0, 0 };
+			else
+				cfg = (struct ovl_alpha_cfg){ 3, 0, 0, 0, 1, 0,  1, 0, 0, 0, 0 };
+		} else {
+			if (glb < 0xff)
+				cfg = (struct ovl_alpha_cfg){ 2, 2, 0, 0, 0, 0,  3, 2, 0, 0, 0 };
+			else
+				cfg = (struct ovl_alpha_cfg){ 0, 0, 0, 0, 0, 0,  1, 0, 0, 0, 0 };
+		}
+	} else if (pixel_blend_mode == DRM_MODE_BLEND_COVERAGE) {
+		if (has_alpha) {
+			if (glb < 0xff)
+				cfg = (struct ovl_alpha_cfg){ 2, 1, 0, 0, 0, 0,  3, 1, 0, 0, 1 };
+			else
+				cfg = (struct ovl_alpha_cfg){ 3, 0, 0, 0, 1, 0,  3, 0, 0, 0, 1 };
+		} else {
+			if (glb < 0xff)
+				cfg = (struct ovl_alpha_cfg){ 2, 2, 0, 0, 0, 0,  3, 2, 0, 0, 0 };
+			else
+				cfg = (struct ovl_alpha_cfg){ 0, 0, 0, 0, 0, 0,  1, 0, 0, 0, 0 };
+		}
+	} else {
+		if (has_alpha)
+			cfg = (struct ovl_alpha_cfg){ 0, 0, 0, 0, 0, 0,  1, 0, 0, 0, 0 };
+		else
+			cfg = (struct ovl_alpha_cfg){ 0, 0, 0, 0, 0, 1,  1, 0, 0, 0, 0 };
+	}
+
+	return (glb << 0) | (cfg.fix_mode << 8) | (cfg.dst_pmode << 9) |
+	       (cfg.alpha_offdst << 10) | (cfg.dst_gmode << 12) | (cfg.dst_amode << 14) |
+	       (glb << 16) | (cfg.alpha_smode << 24) | (cfg.src_pmode << 25) |
+	       (cfg.src_lmode << 26) | (cfg.alpha_offdst << 27) | (cfg.src_gmode << 28) |
+	       (cfg.src_amode << 30);
+}
+
+static void marie_dss_program_rch(const struct marie_dss_rch *rch,
+				  struct drm_plane_state *st, u32 paddr,
+				  unsigned int layer_idx)
+{
+	struct drm_framebuffer *fb = st->fb;
+	u32 fourcc = fb->format->format;
+	u32 pitch = fb->pitches[0];
+	u32 src_x = st->src_x >> 16;
+	u32 src_y = st->src_y >> 16;
+	u32 src_w = st->src_w >> 16;
+	u32 src_h = st->src_h >> 16;
+	u32 dst_x = st->dst.x1;
+	u32 dst_y = st->dst.y1;
+	u32 dst_w = drm_rect_width(&st->dst);
+	u32 dst_h = drm_rect_height(&st->dst);
+	u32 aligned_left = src_x & ~3U;
+	u32 aligned_right = (src_x + src_w - 1U) | 3U;
+	u32 clip_left = src_x - aligned_left;
+	u32 clip_right = aligned_right - (src_x + src_w - 1U);
+	u32 aligned_w = aligned_right - aligned_left + 1U;
+	u32 rdma_addr = paddr + src_y * pitch + aligned_left * 4U;
+	u32 dma_fmt, dfc_fmt;
+	u32 dma = rch->dma_off;
+	u32 dfc = rch->dfc_off;
+	u32 ovl_l = 0x60000U + layer_idx * 0x3cU;
+
+	switch (fourcc) {
+	case DRM_FORMAT_ARGB8888:
+		dma_fmt = 5;
+		dfc_fmt = 6;
+		break;
+	case DRM_FORMAT_XRGB8888:
+		dma_fmt = 6;
+		dfc_fmt = 5;
+		break;
+	case DRM_FORMAT_ABGR8888:
+		dma_fmt = 5;
+		dfc_fmt = 13;
+		break;
+	case DRM_FORMAT_XBGR8888:
+	default:
+		dma_fmt = 6;
+		dfc_fmt = 12;
+		break;
+	}
+
+	/* RDMA (shadowed registers only — never pulse CH_REG_DEFAULT mid-frame) */
+	writel(aligned_left >> 2, marie_dss_base + dma + 0x00);
+	writel(src_y, marie_dss_base + dma + 0x04);
+	writel(aligned_right >> 2, marie_dss_base + dma + 0x08);
+	writel(src_y + src_h - 1U, marie_dss_base + dma + 0x0c);
+	writel(0, marie_dss_base + dma + 0x10);
+	writel(0, marie_dss_base + dma + 0x14);
+	writel(src_h - 1U, marie_dss_base + dma + 0x18);
+	writel(dma_fmt << 3, marie_dss_base + dma + 0x1c);
+	writel(0, marie_dss_base + dma + 0x20);
+	writel(rdma_addr, marie_dss_base + dma + 0x60);
+	writel(pitch >> 4, marie_dss_base + dma + 0x64);
+	writel(0, marie_dss_base + dma + 0x68);
+	writel(0, marie_dss_base + dma + 0xd0);
+	writel(1, marie_dss_base + dma + 0xd4);
+	if (marie_dss_default_buf_ctrl)
+		writel(marie_dss_default_buf_ctrl, marie_dss_base + dma + 0x800);
+
+	/* DFC */
+	writel(((aligned_w - 1U) << 16) | (src_h - 1U), marie_dss_base + dfc + 0x00);
+	writel(0, marie_dss_base + dfc + 0x04);
+	writel(dfc_fmt << 1, marie_dss_base + dfc + 0x0c);
+	writel((clip_left << 16) | clip_right, marie_dss_base + dfc + 0x10);
+	writel(0, marie_dss_base + dfc + 0x14);
+	writel(1, marie_dss_base + dfc + 0x18);
+	writel(1, marie_dss_base + dfc + 0x1c);
+	writel(0, marie_dss_base + dfc + 0x20);
+	writel(0, marie_dss_base + dfc + 0x24);
+	writel(3, marie_dss_base + dfc + 0x40);
+
+	/* OVL0 layer */
+	writel((dst_y << 16) | dst_x, marie_dss_base + ovl_l + 0x14);
+	writel(((dst_y + dst_h - 1U) << 16) | (dst_x + dst_w - 1U),
+	       marie_dss_base + ovl_l + 0x18);
+	writel(0, marie_dss_base + ovl_l + 0x2c);
+	writel(marie_dss_ovl_alpha_reg(fourcc, st->pixel_blend_mode, st->alpha),
+	       marie_dss_base + ovl_l + 0x30);
+	writel(1, marie_dss_base + ovl_l + 0x34);
+	writel((dst_y << 16) | dst_x, marie_dss_base + ovl_l + 0x38);
+	writel(((dst_y + dst_h - 1U) << 16) | (dst_x + dst_w - 1U),
+	       marie_dss_base + ovl_l + 0x3c);
+
+	/* MCTL channel routing + flush (STARTY unused on DSSv320 online OV0) */
+	writel((1U << (layer_idx + 1U)) | 0x100U, marie_dss_base + rch->ov_oen_off);
+	writel(1, marie_dss_base + rch->mutex_off);
+	writel(1, marie_dss_base + rch->flush_off);
+}
+
+static void marie_dss_commit_ovl0(struct drm_crtc *crtc,
+				  struct drm_atomic_state *state)
+{
+	struct drm_device *dev = crtc->dev;
+	struct simpledrm_device *sdev = simpledrm_device_of_dev(dev);
+	struct {
+		unsigned int slot;
+		struct drm_plane_state *st;
+		u32 paddr;
+	} active[MARIE_NUM_PLANES];
+	unsigned int count = 0, i, j;
+	u32 w = sdev->mode.hdisplay;
+	u32 h = sdev->mode.vdisplay;
+	u32 chn_ov_sel = 0xfffffff8U;
+	unsigned long dflags;
+	int idx;
+
+	if (!marie_dss_tribuf || !marie_dss_base)
+		return;
+
+	for (i = 0; i < MARIE_NUM_PLANES; i++) {
+		struct drm_plane *p = (i == 0) ? &sdev->primary_plane :
+						 &sdev->overlay_planes[i - 1];
+		struct drm_plane_state *st;
+		u32 paddr;
+
+		if (!p->dev)
+			continue;
+		st = drm_atomic_get_new_plane_state(state, p);
+		if (!st)
+			st = p->state;
+		if (!st || !st->visible || !st->fb)
+			continue;
+		paddr = marie_get_plane_paddr(st->fb);
+		if (!paddr) {
+			/* Non-CMA shadow copy handled in primary atomic_update */
+			return;
+		}
+		active[count].slot = i;
+		active[count].st = st;
+		active[count].paddr = paddr;
+		count++;
+	}
+
+	if (!count)
+		return;
+
+	/* Sort active planes by normalized_zpos ascending */
+	for (i = 1; i < count; i++) {
+		for (j = i; j > 0 &&
+		     active[j - 1].st->normalized_zpos > active[j].st->normalized_zpos; j--)
+			swap(active[j - 1], active[j]);
+	}
+
+	if (!drm_dev_enter(dev, &idx))
+		return;
+
+	dsb(st);
+	spin_lock_irqsave(&marie_dss_lock, dflags);
+
+	writel(1, marie_dss_base + 0x10804); /* MCTL_CTL_MUTEX lock */
+
+	/* Configure OVL0 base (shadowed registers only — never pulse OVL6_REG_DEFAULT mid-frame) */
+	writel(((h - 1U) << 16) | (w - 1U), marie_dss_base + 0x60000);
+	writel(0xff000000U, marie_dss_base + 0x60004);
+	writel(0, marie_dss_base + 0x60008);
+	writel(((h - 1U) << 16) | (w - 1U), marie_dss_base + 0x6000c);
+	writel(0x00010001U, marie_dss_base + 0x60010);
+	writel((h - 1U) << 16, marie_dss_base + 0x601a0);
+
+	/* Disable unused OVL0 layers (count..5) */
+	for (i = count; i < 6; i++)
+		writel(0, marie_dss_base + 0x60034 + i * 0x3c);
+
+	/* Program each active plane in zpos order */
+	{
+		u32 used_mask = 0;
+
+		for (i = 0; i < count; i++) {
+			const struct marie_dss_rch *rch = &marie_dss_rchs[active[i].slot];
+
+			used_mask |= BIT(active[i].slot);
+			marie_dss_program_rch(rch, active[i].st, active[i].paddr, i);
+			chn_ov_sel &= ~(0xfU << ((i + 1U) * 4U));
+			chn_ov_sel |= ((u32)rch->rch_id << ((i + 1U) * 4U));
+		}
+		/* Cleanly disable unused RCH channels */
+		for (i = 0; i < MARIE_NUM_PLANES; i++) {
+			if (used_mask & BIT(i))
+				continue;
+			writel(0, marie_dss_base + marie_dss_rchs[i].dma_off + 0xd4);
+			writel(0, marie_dss_base + marie_dss_rchs[i].ov_oen_off);
+			writel(0, marie_dss_base + marie_dss_rchs[i].mutex_off);
+			writel(1, marie_dss_base + marie_dss_rchs[i].flush_off);
+		}
+	}
+
+	writel(chn_ov_sel, marie_dss_base + 0x10180); /* MCTL_RCH_OV0_SEL */
+	writel(1, marie_dss_base + 0x10818);          /* MCTL_CTL_MUTEX_OV */
+	writel(1, marie_dss_base + 0x10128);          /* MCTL_OV0_FLUSH_EN */
+	dsb(st);
+	writel(0, marie_dss_base + 0x10804);          /* MCTL_CTL_MUTEX unlock */
+
+	marie_ovl_active = true;
+	spin_unlock_irqrestore(&marie_dss_lock, dflags);
+	drm_dev_exit(idx);
+}
+
 static int marie_simpledrm_begin_fb_access(struct drm_plane *plane,
 					   struct drm_plane_state *new_plane_state)
 {
-	struct simpledrm_device *sdev = simpledrm_device_of_dev(plane->dev);
-
-	if (marie_get_zero_copy_paddr(sdev, new_plane_state->fb))
+	if (marie_get_plane_paddr(new_plane_state->fb))
 		return 0;
 	return drm_gem_begin_shadow_fb_access(plane, new_plane_state);
 }
@@ -891,12 +1223,66 @@ static int marie_simpledrm_begin_fb_access(struct drm_plane *plane,
 static void marie_simpledrm_end_fb_access(struct drm_plane *plane,
 					  struct drm_plane_state *old_plane_state)
 {
-	struct simpledrm_device *sdev = simpledrm_device_of_dev(plane->dev);
-
-	if (marie_get_zero_copy_paddr(sdev, old_plane_state->fb))
+	if (marie_get_plane_paddr(old_plane_state->fb))
 		return;
 	drm_gem_end_shadow_fb_access(plane, old_plane_state);
 }
+
+static int marie_overlay_plane_atomic_check(struct drm_plane *plane,
+					    struct drm_atomic_state *state)
+{
+	struct drm_plane_state *new_st = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_crtc_state *crtc_st = NULL;
+	struct simpledrm_device *sdev = simpledrm_device_of_dev(plane->dev);
+	int ret;
+
+	if (new_st->crtc)
+		crtc_st = drm_atomic_get_new_crtc_state(state, new_st->crtc);
+
+	ret = drm_atomic_helper_check_plane_state(new_st, crtc_st,
+						  DRM_PLANE_NO_SCALING,
+						  DRM_PLANE_NO_SCALING,
+						  true, true);
+	if (ret)
+		return ret;
+	if (!new_st->visible)
+		return 0;
+	if (!marie_plane_can_hw_scanout(sdev, new_st))
+		return -EINVAL;
+	return 0;
+}
+
+static void marie_overlay_plane_atomic_update(struct drm_plane *plane,
+					      struct drm_atomic_state *state)
+{
+}
+
+static void marie_overlay_plane_atomic_disable(struct drm_plane *plane,
+					       struct drm_atomic_state *state)
+{
+}
+
+static const struct drm_plane_helper_funcs marie_overlay_plane_helper_funcs = {
+	.atomic_check = marie_overlay_plane_atomic_check,
+	.atomic_update = marie_overlay_plane_atomic_update,
+	.atomic_disable = marie_overlay_plane_atomic_disable,
+};
+
+static const struct drm_plane_funcs marie_overlay_plane_funcs = {
+	.update_plane = drm_atomic_helper_update_plane,
+	.disable_plane = drm_atomic_helper_disable_plane,
+	.destroy = drm_plane_cleanup,
+	.reset = drm_atomic_helper_plane_reset,
+	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
+};
+
+static const uint32_t marie_overlay_formats[] = {
+	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_ABGR8888,
+};
 #endif
 
 static int simpledrm_primary_plane_helper_atomic_check(struct drm_plane *plane,
@@ -918,15 +1304,23 @@ static int simpledrm_primary_plane_helper_atomic_check(struct drm_plane *plane,
 	ret = drm_atomic_helper_check_plane_state(new_plane_state, new_crtc_state,
 						  DRM_PLANE_NO_SCALING,
 						  DRM_PLANE_NO_SCALING,
+#ifdef CONFIG_ARM64
+						  marie_dss_tribuf, marie_dss_tribuf);
+#else
 						  false, false);
+#endif
 	if (ret)
 		return ret;
 	else if (!new_plane_state->visible)
 		return 0;
 
 #ifdef CONFIG_ARM64
-	if (marie_get_zero_copy_paddr(sdev, new_fb))
+	if (marie_plane_can_hw_scanout(sdev, new_plane_state))
 		return 0;
+	if (new_plane_state->dst.x1 != 0 || new_plane_state->dst.y1 != 0 ||
+	    drm_rect_width(&new_plane_state->dst) != sdev->mode.hdisplay ||
+	    drm_rect_height(&new_plane_state->dst) != sdev->mode.vdisplay)
+		return -EINVAL;
 #endif
 	if (new_fb->format != sdev->format) {
 		void *buf;
@@ -955,32 +1349,8 @@ static void simpledrm_primary_plane_helper_atomic_update(struct drm_plane *plane
 	int ret, idx;
 
 #ifdef CONFIG_ARM64
-	{
-		u32 zc_paddr = marie_get_zero_copy_paddr(sdev, fb);
-
-		if (zc_paddr) {
-			bool is_bgr = (fb->format->format == DRM_FORMAT_ABGR8888 ||
-				       fb->format->format == DRM_FORMAT_XBGR8888);
-			u32 dfc_fmt = is_bgr ? (13U << 1) : (6U << 1);
-			unsigned long dflags;
-
-			if (!drm_dev_enter(dev, &idx))
-				return;
-			dsb(st);
-			spin_lock_irqsave(&marie_dss_lock, dflags);
-			writel(1, marie_dss_base + 0x10804);
-			writel(zc_paddr, marie_dss_base + marie_dss_dma_off + 0x60);
-			writel(fb->pitches[0] >> 4, marie_dss_base + marie_dss_dma_off + 0x64);
-			writel(dfc_fmt, marie_dss_base + marie_dss_dma_off + 0x10c);
-			writel(1, marie_dss_base + marie_dss_flush_off);
-			writel(1, marie_dss_base + 0x10128);
-			dsb(st);
-			writel(0, marie_dss_base + 0x10804);
-			spin_unlock_irqrestore(&marie_dss_lock, dflags);
-			drm_dev_exit(idx);
-			return;
-		}
-	}
+	if (marie_plane_can_hw_scanout(sdev, plane_state))
+		return;
 #endif
 
 	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
@@ -1717,10 +2087,17 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 	max_width = max_t(unsigned long, width, DRM_SHADOW_PLANE_MAX_WIDTH);
 	max_height = max_t(unsigned long, height, DRM_SHADOW_PLANE_MAX_HEIGHT);
 
+#ifdef CONFIG_ARM64
+	dev->mode_config.min_width = marie_dss_tribuf ? 1 : width;
+	dev->mode_config.max_width = max_width;
+	dev->mode_config.min_height = marie_dss_tribuf ? 1 : height;
+	dev->mode_config.max_height = max_height;
+#else
 	dev->mode_config.min_width = width;
 	dev->mode_config.max_width = max_width;
 	dev->mode_config.min_height = height;
 	dev->mode_config.max_height = max_height;
+#endif
 	dev->mode_config.preferred_depth = format->depth;
 	dev->mode_config.funcs = &simpledrm_mode_config_funcs;
 
@@ -1744,6 +2121,16 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 		return ERR_PTR(ret);
 	drm_plane_helper_add(primary_plane, &simpledrm_primary_plane_helper_funcs);
 	drm_plane_enable_fb_damage_clips(primary_plane);
+#ifdef CONFIG_ARM64
+	if (marie_dss_tribuf) {
+		drm_plane_create_zpos_property(primary_plane, 0, 0, MARIE_NUM_PLANES - 1);
+		drm_plane_create_alpha_property(primary_plane);
+		drm_plane_create_blend_mode_property(primary_plane,
+						     BIT(DRM_MODE_BLEND_PIXEL_NONE) |
+						     BIT(DRM_MODE_BLEND_PREMULTI) |
+						     BIT(DRM_MODE_BLEND_COVERAGE));
+	}
+#endif
 
 	/* CRTC */
 
@@ -1753,6 +2140,37 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 	if (ret)
 		return ERR_PTR(ret);
 	drm_crtc_helper_add(crtc, &simpledrm_crtc_helper_funcs);
+
+#ifdef CONFIG_ARM64
+	if (marie_dss_tribuf) {
+		unsigned int oi;
+
+		dev->mode_config.normalize_zpos = true;
+		for (oi = 0; oi < MARIE_NUM_OVERLAYS; oi++) {
+			struct drm_plane *ovl = &sdev->overlay_planes[oi];
+
+			ret = drm_universal_plane_init(dev, ovl, drm_crtc_mask(crtc),
+						       &marie_overlay_plane_funcs,
+						       marie_overlay_formats,
+						       ARRAY_SIZE(marie_overlay_formats),
+						       simpledrm_primary_plane_format_modifiers,
+						       DRM_PLANE_TYPE_OVERLAY,
+						       "DSS-%s",
+						       marie_dss_rchs[oi + 1].name);
+			if (ret)
+				return ERR_PTR(ret);
+			drm_plane_helper_add(ovl, &marie_overlay_plane_helper_funcs);
+			drm_plane_create_zpos_property(ovl, oi + 1, 0, MARIE_NUM_PLANES - 1);
+			drm_plane_create_alpha_property(ovl);
+			drm_plane_create_blend_mode_property(ovl,
+							     BIT(DRM_MODE_BLEND_PIXEL_NONE) |
+							     BIT(DRM_MODE_BLEND_PREMULTI) |
+							     BIT(DRM_MODE_BLEND_COVERAGE));
+		}
+		pr_info("kirin710-dss: registered %u hardware planes (D2 primary + D3/D0/D1 overlays)\n",
+			MARIE_NUM_PLANES);
+	}
+#endif
 
 	/* Encoder */
 
